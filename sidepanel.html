@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="system">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Collections</title>
+    <script src="popup-mode.js"></script>
+    <link rel="stylesheet" href="sidepanel.css" />
+  </head>
+  <body>
+    <!-- LIST VIEW: all collections -->
+    <div id="list-view" class="view">
+      <header class="topbar">
+        <h1>Collections</h1>
+        <div class="topbar-actions">
+          <button id="pin-btn" class="icon-btn" aria-label="Pin to side panel" aria-pressed="false" title="Pin panel (open on toolbar click)">📌</button>
+          <button id="settings-btn" class="icon-btn" aria-label="Settings" title="Settings">⚙</button>
+          <button id="import-btn" class="icon-btn" aria-label="Import from JSON" title="Import from JSON">⭱</button>
+          <button id="export-all-btn" class="icon-btn" aria-label="Export all as JSON" title="Export all as JSON">⭳</button>
+          <button id="new-collection-btn" class="primary-btn">＋ New collection</button>
+        </div>
+      </header>
+      <div class="searchbar">
+        <input
+          id="search-input"
+          class="search-input"
+          type="search"
+          aria-label="Search across all collections"
+          placeholder="Search across all collections…"
+          autocomplete="off"
+        />
+      </div>
+      <ul id="collections-list" class="collections-list" aria-label="Collections"></ul>
+      <div id="search-results" class="items-list hidden" role="list" aria-label="Search results"></div>
+      <div id="empty-search" class="empty-state hidden">
+        <p>No matches.</p>
+      </div>
+      <div id="empty-collections" class="empty-state hidden">
+        <p>No collections yet.</p>
+        <p class="hint">Create one, then right-click any page, link, or image to add it.</p>
+      </div>
+    </div>
+
+    <!-- DETAIL VIEW: a single collection -->
+    <div id="detail-view" class="view hidden">
+      <header class="topbar">
+        <button id="back-btn" class="icon-btn" aria-label="Back to collections" title="Back">←</button>
+        <input id="collection-name-input" class="name-input" type="text" aria-label="Collection name" />
+        <div class="topbar-actions">
+          <button id="detail-menu-btn" class="icon-btn" aria-label="More actions" aria-haspopup="menu" aria-expanded="false" title="More">⋯</button>
+        </div>
+      </header>
+
+      <div class="detail-toolbar">
+        <button id="add-current-tab-btn" class="primary-btn add-current-tab-btn">＋ Add current tab</button>
+      </div>
+
+      <div id="detail-menu" class="menu hidden" role="menu" aria-label="Collection actions">
+        <button data-action="add-current" role="menuitem">Add current page</button>
+        <button data-action="add-tabs" role="menuitem">Add open tabs…</button>
+        <button data-action="add-note" role="menuitem">Add note</button>
+        <button data-action="add-image" role="menuitem">Add image by URL…</button>
+        <hr />
+        <button data-action="add-section" role="menuitem">Add section</button>
+        <hr />
+        <button data-action="open-all" role="menuitem">Open all links</button>
+        <button data-action="copy-all" role="menuitem">Copy all</button>
+        <button data-action="export-one" role="menuitem">Export this collection</button>
+        <hr />
+        <button data-action="delete-collection" class="danger" role="menuitem">Delete collection</button>
+      </div>
+
+      <div id="detail-scroll" class="detail-scroll">
+        <ul id="items-list" class="items-list item-container" data-section-id=""></ul>
+        <div id="sections-container"></div>
+        <div id="add-section" class="add-section hidden">
+          <input
+            id="add-section-input"
+            class="add-section-input"
+            type="text"
+            placeholder="＋ Add section"
+            autocomplete="off"
+          />
+        </div>
+        <div id="empty-items" class="empty-state hidden">
+          <p>This collection is empty.</p>
+          <p class="hint">Use the ⋯ menu or the right-click "Add to Collection" option.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- Add-open-tabs picker -->
+    <div id="tabs-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="tabs-modal-title">
+      <div class="modal-card">
+        <h2 id="tabs-modal-title">Add open tabs</h2>
+        <ul id="tabs-picker" class="tabs-picker"></ul>
+        <div class="modal-actions">
+          <button id="tabs-cancel" class="secondary-btn">Cancel</button>
+          <button id="tabs-add" class="primary-btn">Add selected</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Pick-collection modal (keyboard shortcut add) -->
+    <div id="pick-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="pick-modal-title">
+      <div class="modal-card">
+        <h2 id="pick-modal-title">Add current tab to…</h2>
+        <div id="pick-tab-preview" class="pick-preview"></div>
+        <ul id="pick-list" class="pick-list"></ul>
+        <div class="modal-actions">
+          <button id="pick-new" class="secondary-btn">＋ New collection</button>
+          <button id="pick-cancel" class="secondary-btn">Cancel</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Settings modal -->
+    <div id="settings-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="settings-modal-title">
+      <div class="modal-card">
+        <h2 id="settings-modal-title">Settings</h2>
+        <div class="settings-group">
+          <div class="settings-label" id="theme-label">Theme</div>
+          <div class="theme-options" role="radiogroup" aria-labelledby="theme-label">
+            <label class="theme-option">
+              <input type="radio" name="theme" value="system" />
+              <span>Browser theme</span>
+            </label>
+            <label class="theme-option">
+              <input type="radio" name="theme" value="light" />
+              <span>Light</span>
+            </label>
+            <label class="theme-option">
+              <input type="radio" name="theme" value="dark" />
+              <span>Dark</span>
+            </label>
+          </div>
+        </div>
+        <div class="settings-group">
+          <label class="theme-option">
+            <input type="checkbox" id="settings-pin" />
+            <span>Pin to side panel (docked right). Unpinned opens as a toolbar popup.</span>
+          </label>
+        </div>
+        <div class="modal-actions">
+          <button id="settings-close" class="primary-btn">Done</button>
+        </div>
+      </div>
+    </div>
+
+    <input id="import-file" type="file" accept="application/json,.json" hidden />
+    <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+
+    <script type="module" src="sidepanel.js"></script>
+  </body>
+</html>
