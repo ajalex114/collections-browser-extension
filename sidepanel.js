@@ -1,5 +1,11 @@
 import { CollectionStore } from "./storage.js";
 
+// Boot timing: helps diagnose slow first-open. Durations print to the panel
+// devtools console as "[Collection][perf] …". T0 is module-evaluation start.
+const BOOT_T0 = performance.now();
+const perf = (label) =>
+  console.log(`[Collection][perf] ${label}: ${(performance.now() - BOOT_T0).toFixed(0)}ms`);
+
 const $ = (sel) => document.querySelector(sel);
 
 // This document serves two surfaces: the docked side panel and the toolbar
@@ -45,7 +51,7 @@ function showList() {
   $("#search-results").classList.add("hidden");
   $("#empty-search").classList.add("hidden");
   $("#collections-list").classList.remove("hidden");
-  renderList();
+  return renderList();
 }
 
 function showDetail(collectionId) {
@@ -1217,8 +1223,17 @@ function bindEvents() {
   });
 }
 
-bindEvents();
-initSettings();
-showList();
-checkPendingAdd();
-checkFocusCollection();
+async function init() {
+  perf("module eval → init start");
+  bindEvents();
+  perf("bindEvents done");
+  await initSettings();
+  perf("initSettings done (theme/pin applied)");
+  await showList();
+  perf("showList/renderList done (collections painted)");
+  await checkPendingAdd();
+  await checkFocusCollection();
+  perf("init complete");
+}
+
+init();

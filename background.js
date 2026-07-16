@@ -8,6 +8,11 @@ const NEW_COLLECTION_ID = "collection-add-new";
 const log = (...args) => console.log("[Collection][bg]", ...args);
 const warn = (...args) => console.warn("[Collection][bg]", ...args);
 
+// Service-worker boot timing. Each cold start logs when the SW script finished
+// evaluating; compare against onStartup/onInstalled/rebuildMenus timings below.
+const SW_T0 = Date.now();
+log("service worker evaluated at", new Date(SW_T0).toISOString());
+
 // Reflect the user's pin preference into the browser's UI surface.
 // - Pinned: clicking the toolbar icon opens the docked side panel (right edge).
 // - Unpinned (default): clicking opens a popup that hangs from the toolbar icon,
@@ -154,6 +159,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
 });
 
 async function rebuildMenus() {
+  const t0 = Date.now();
   await chrome.contextMenus.removeAll();
   const contexts = ["page", "link", "image", "selection"];
   chrome.contextMenus.create({
@@ -186,6 +192,7 @@ async function rebuildMenus() {
     title: "＋ New collection…",
     contexts,
   });
+  log("rebuildMenus done in", Date.now() - t0, "ms for", collections.length, "collections");
 }
 
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
