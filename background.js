@@ -384,6 +384,7 @@ function spotlightOverlay(collections, theme) {
   let selected = 0;
 
   function close() {
+    window.removeEventListener("keydown", onKeyCapture, true);
     host.remove();
     log("overlay closed");
   }
@@ -458,19 +459,35 @@ function spotlightOverlay(collections, theme) {
   input.addEventListener("keyup", swallow, true);
 
   input.addEventListener("input", (e) => render(e.target.value));
-  input.addEventListener("keydown", (e) => {
-    if (e.key === "Escape") close();
-    else if (e.key === "ArrowDown") {
+
+  // Navigation keys are handled on WINDOW in the capture phase so the overlay
+  // gets them before any page-level handler (some sites capture Arrow/Enter/Esc
+  // and preventDefault them, which would otherwise break navigation). For these
+  // keys we fully own the event: preventDefault + stopImmediatePropagation so
+  // neither the page nor the input's default (cursor move / newline) reacts.
+  // Other keys fall through to the focused input so typing still works.
+  function onKeyCapture(e) {
+    const k = e.key;
+    if (k === "Escape") {
       e.preventDefault();
+      e.stopImmediatePropagation();
+      close();
+    } else if (k === "ArrowDown") {
+      e.preventDefault();
+      e.stopImmediatePropagation();
       select(selected + 1);
-    } else if (e.key === "ArrowUp") {
+    } else if (k === "ArrowUp") {
       e.preventDefault();
+      e.stopImmediatePropagation();
       select(selected - 1);
-    } else if (e.key === "Enter") {
+    } else if (k === "Enter") {
       e.preventDefault();
+      e.stopImmediatePropagation();
       activate(selected, e.ctrlKey || e.metaKey);
     }
-  });
+  }
+  window.addEventListener("keydown", onKeyCapture, true);
+
   host.addEventListener("click", (e) => {
     if (e.target === host) close();
   });
