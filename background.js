@@ -112,6 +112,29 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   return true; // async response
 });
 
+// Quick-save picker: create a collection or section without saving anything yet,
+// so the picker can stay open and let the user then choose where to save.
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  if (msg?.type === "create-collection") {
+    CollectionStore.createCollection(msg.name)
+      .then((col) => {
+        log("create-collection:", col.id, col.name);
+        sendResponse({ collection: { id: col.id, name: col.name } });
+      })
+      .catch((err) => sendResponse({ error: err.message }));
+    return true;
+  }
+  if (msg?.type === "create-section") {
+    CollectionStore.addSection(msg.collectionId, msg.title)
+      .then((sec) => {
+        log("create-section:", sec && sec.id);
+        sendResponse({ section: sec ? { id: sec.id, title: sec.title } : null });
+      })
+      .catch((err) => sendResponse({ error: err.message }));
+    return true;
+  }
+});
+
 // Spotlight (page overlay) asks to open a collection in the side panel.
 chrome.runtime.onMessage.addListener((msg, sender) => {
   if (msg?.type !== "open-collection") return;
@@ -493,14 +516,13 @@ function quickSaveOverlay(collections, theme) {
   host.setAttribute("role", "dialog");
   host.setAttribute("aria-modal", "true");
   host.setAttribute("aria-label", "Save to collection");
-  host.style.cssText =
-    "position:fixed;inset:0;z-index:2147483647;display:flex;align-items:flex-start;" +
-    "justify-content:center;padding-top:14vh;background:" + c.scrim + ";" +
-    "backdrop-filter:blur(7px);-webkit-backdrop-filter:blur(7px);";
+  host.style.cssText = "position:fixed;inset:0;z-index:2147483647;";
   const shadow = host.attachShadow({ mode: "open" });
   shadow.innerHTML =
     "<style>" +
     "*{box-sizing:border-box;font-family:'Segoe UI',system-ui,-apple-system,sans-serif;}" +
+    ".backdrop{position:fixed;inset:0;display:flex;align-items:flex-start;justify-content:center;" +
+    "padding-top:14vh;background:" + c.scrim + ";backdrop-filter:blur(7px);-webkit-backdrop-filter:blur(7px);}" +
     ".card{width:min(620px,94vw);max-height:66vh;display:flex;flex-direction:column;" +
     "background:" + c.cardBg + ";color:" + c.text + ";border:1px solid " + c.border + ";" +
     "border-radius:18px;box-shadow:" + c.glow + ";overflow:hidden;}" +
@@ -528,6 +550,7 @@ function quickSaveOverlay(collections, theme) {
     "border:1px solid " + c.selBg + ";background:" + c.cardBg + ";color:" + c.text + ";" +
     "font-size:14px;outline:none;}" +
     "</style>" +
+    "<div class='backdrop'>" +
     "<div class='card'>" +
     "<div class='head'>Save <b class='pg'></b> to…</div>" +
     "<div class='body'>" +
@@ -536,9 +559,11 @@ function quickSaveOverlay(collections, theme) {
     "</div>" +
     "<div class='foot'><span class='hint'>↑↓ move · → sections · ↵ save · Esc close</span>" +
     "<span role='status' aria-live='polite' class='status'></span></div>" +
+    "</div>" +
     "</div>";
   (document.body || document.documentElement).appendChild(host);
 
+  const backdrop = shadow.querySelector(".backdrop");
   shadow.querySelector(".pg").textContent = "“" + (document.title || location.href) + "”";
   const colWrap = shadow.getElementById("qs-cols");
   const secWrap = shadow.getElementById("qs-secs");
@@ -572,8 +597,9 @@ function quickSaveOverlay(collections, theme) {
     commit({ collectionId, sectionId: sectionId || null }, label);
   }
 
-  // Swap a "＋ New…" row for an inline text input. Enter commits, Esc/blur
-  // restores the row. Keystrokes are isolated from the page (some sites bind
+  // Swap a "＋ New…" row for an inline text input. Enter OR clicking elsewhere
+  // (blur) commits the typed name; Esc cancels and restores the row. Empty text
+  // just restores. Keystrokes are isolated from the page (some sites bind
   // single-key shortcuts that would otherwise swallow letters).
   function openInlineInput(row, placeholder, onCommit) {
     const input = document.createElement("input");
@@ -581,27 +607,76 @@ function quickSaveOverlay(collections, theme) {
     input.placeholder = placeholder;
     input.setAttribute("aria-label", placeholder);
     input.className = "inline-input";
-    const restore = () => {
-      if (input.parentNode) input.replaceWith(row);
+    let done = false;
+    const finish = (accept) => {
+      if (done) return;
+      done = true;
+      const v = input.value.trim();
+      if (accept && v) onCommit(v);
+      else if (input.parentNode) input.replaceWith(row);
     };
     const swallow = (e) => e.stopPropagation();
     input.addEventListener("keydown", (e) => {
       e.stopPropagation();
       if (e.key === "Enter") {
         e.preventDefault();
-        const v = input.value.trim();
-        if (v) onCommit(v);
-        else restore();
+        finish(true);
       } else if (e.key === "Escape") {
         e.preventDefault();
-        restore();
+        finish(false);
       }
     });
     input.addEventListener("keypress", swallow);
     input.addEventListener("keyup", swallow);
-    input.addEventListener("blur", restore);
+    input.addEventListener("blur", () => finish(true));
     row.replaceWith(input);
     input.focus();
+  }
+
+  // Create a collection and keep the picker open, selecting the new collection
+  // so the user can then pick/create a section or click to save into it.
+  function createCollection(name) {
+    statusEl.textContent = "Creating…";
+    chrome.runtime.sendMessage({ type: "create-collection", name }, (resp) => {
+      if (!resp || resp.error || !resp.collection) {
+        statusEl.textContent = "Couldn't create collection";
+        return;
+      }
+      collections.push({ id: resp.collection.id, name: resp.collection.name, sections: [], items: [] });
+      colIdx = collections.length - 1;
+      zone = "col";
+      renderCollections();
+      renderSections();
+      paintSel();
+      statusEl.textContent = "Created “" + resp.collection.name + "”";
+      const rows = [...colWrap.querySelectorAll(".row")];
+      if (rows[colIdx]) rows[colIdx].focus();
+    });
+  }
+
+  // Create a section in the current collection and keep the picker open,
+  // selecting the new section.
+  function createSection(title) {
+    const col = collections[colIdx];
+    if (!col) return;
+    statusEl.textContent = "Adding section…";
+    chrome.runtime.sendMessage({ type: "create-section", collectionId: col.id, title }, (resp) => {
+      if (!resp || resp.error || !resp.section) {
+        statusEl.textContent = "Couldn't add section";
+        return;
+      }
+      if (!Array.isArray(col.sections)) col.sections = [];
+      col.sections.push({ id: resp.section.id, title: resp.section.title });
+      zone = "sec";
+      renderCollections();
+      renderSections();
+      secIdx = curSecOptions.findIndex((o) => o.sectionId === resp.section.id);
+      if (secIdx < 0) secIdx = 0;
+      paintSel();
+      statusEl.textContent = "Added section “" + resp.section.title + "”";
+      const rows = [...secWrap.querySelectorAll(".row")];
+      if (rows[secIdx]) rows[secIdx].focus();
+    });
   }
 
   let zone = "col"; // "col" | "sec"
@@ -609,39 +684,10 @@ function quickSaveOverlay(collections, theme) {
   let secIdx = 0;
   let curSecOptions = []; // [{sectionId, label}]
 
-  if (!collections.length) {
-    colWrap.innerHTML = "";
-    const e = document.createElement("div");
-    e.className = "empty";
-    e.textContent = "No collections yet — create one:";
-    colWrap.appendChild(e);
-    const newRow = document.createElement("div");
-    newRow.className = "newrow";
-    newRow.tabIndex = 0;
-    newRow.textContent = "＋ New collection";
-    newRow.addEventListener("click", () =>
-      openInlineInput(newRow, "Collection name…", (name) => commit({ newCollection: name }, name))
-    );
-    colWrap.appendChild(newRow);
-    host.addEventListener("keydown", (ev) => {
-      if (shadow.activeElement && shadow.activeElement.tagName === "INPUT") return;
-      if (ev.key === "Escape") close();
-      else if (ev.key === "Enter" && shadow.activeElement === newRow) {
-        ev.preventDefault();
-        newRow.click();
-      }
-    });
-    host.tabIndex = -1;
-    newRow.focus();
-    host.addEventListener("click", (ev) => {
-      if (ev.target === host) close();
-    });
-    return;
-  }
-
   function renderSections() {
     const col = collections[colIdx];
     secWrap.innerHTML = "";
+    if (!col) return;
     const title = document.createElement("div");
     title.className = "pane-title";
     title.textContent = col.name || "Untitled";
@@ -671,9 +717,7 @@ function quickSaveOverlay(collections, theme) {
     newSec.tabIndex = 0;
     newSec.textContent = "＋ New section";
     newSec.addEventListener("click", () =>
-      openInlineInput(newSec, "Section name…", (title) =>
-        commit({ collectionId: collections[colIdx].id, newSection: title }, title)
-      )
+      openInlineInput(newSec, "Section name…", (title) => createSection(title))
     );
     secWrap.appendChild(newSec);
     paintSel();
@@ -711,7 +755,7 @@ function quickSaveOverlay(collections, theme) {
     newCol.tabIndex = 0;
     newCol.textContent = "＋ New collection";
     newCol.addEventListener("click", () =>
-      openInlineInput(newCol, "Collection name…", (name) => commit({ newCollection: name }, name))
+      openInlineInput(newCol, "Collection name…", (name) => createCollection(name))
     );
     colWrap.appendChild(newCol);
   }
@@ -761,18 +805,23 @@ function quickSaveOverlay(collections, theme) {
       e.preventDefault();
     } else if (e.key === "ArrowDown") {
       e.preventDefault();
-      if (zone === "col") colIdx = (colIdx + 1) % collections.length;
-      else secIdx = (secIdx + 1) % curSecOptions.length;
-      if (zone === "col") renderSections();
+      if (zone === "col") {
+        if (!collections.length) return;
+        colIdx = (colIdx + 1) % collections.length;
+        renderSections();
+      } else secIdx = (secIdx + 1) % curSecOptions.length;
       paintSel();
     } else if (e.key === "ArrowUp") {
       e.preventDefault();
-      if (zone === "col") colIdx = (colIdx - 1 + collections.length) % collections.length;
-      else secIdx = (secIdx - 1 + curSecOptions.length) % curSecOptions.length;
-      if (zone === "col") renderSections();
+      if (zone === "col") {
+        if (!collections.length) return;
+        colIdx = (colIdx - 1 + collections.length) % collections.length;
+        renderSections();
+      } else secIdx = (secIdx - 1 + curSecOptions.length) % curSecOptions.length;
       paintSel();
     } else if (e.key === "ArrowRight") {
       e.preventDefault();
+      if (!collections.length) return;
       zone = "sec";
       secIdx = 0;
       paintSel();
@@ -783,6 +832,7 @@ function quickSaveOverlay(collections, theme) {
     } else if (e.key === "Enter") {
       e.preventDefault();
       const col = collections[colIdx];
+      if (!col) return;
       if (zone === "sec") {
         const opt = curSecOptions[secIdx];
         save(col.id, opt.sectionId, opt.label);
@@ -791,11 +841,15 @@ function quickSaveOverlay(collections, theme) {
       }
     }
   }, true);
-  host.addEventListener("click", (e) => {
-    if (e.target === host) close();
+  // Backdrop lives inside the shadow root, so its click target is reliable
+  // (host-level clicks are retargeted to the host and can't be distinguished).
+  backdrop.addEventListener("click", (e) => {
+    if (e.target === backdrop) close();
   });
   host.tabIndex = -1;
-  host.focus();
+  const firstFocus = colWrap.querySelector(".row") || colWrap.querySelector(".newrow");
+  if (firstFocus) firstFocus.focus();
+  else host.focus();
 }
 
 function buildItemFromContext(info, tab) {

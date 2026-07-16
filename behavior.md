@@ -60,10 +60,12 @@ or its behavior changes.
    **click a section** (or the **↑ Top of…** option) to save it there — a single
    click, no extra confirmation.
    - The collections pane ends with a **＋ New collection** row and the sections
-     pane with a **＋ New section** row; clicking either turns into a text box —
-     type a name and press **Enter** to create it and save the page into it in
-     one step. (If you have no collections yet, the picker opens straight to the
-     new-collection box.)
+     pane with a **＋ New section** row. Click either to turn it into a text box;
+     type a name and press **Enter** (or click elsewhere) to create it. The
+     picker **stays open** and selects what you just created, so you can then
+     click it (or the item within) to save the page — or add a section to a new
+     collection first. Press **Esc** in the box to cancel. (With no collections
+     yet, the picker opens straight to the new-collection box.)
 4. Keyboard: **↑/↓** move within the current pane, **→** jumps to the sections
    pane, **←** returns to collections, **Enter** saves the current selection,
    **Esc** backs out of the sections pane or closes the picker.
