@@ -2,15 +2,16 @@
   "manifest_version": 3,
   "name": "Collection",
   "version": "1.0.0",
-  "description": "Save, organize, and export web pages, notes, and images into collections — a faithful reimplementation of the Edge Collections feature.",
+  "description": "Save, organize, and export web pages, notes, and images into collections. Private, local-first, with cross-device sync.",
   "minimum_chrome_version": "114",
   "permissions": [
     "storage",
     "contextMenus",
     "sidePanel",
-    "activeTab",
     "tabs",
-    "scripting"
+    "alarms",
+    "scripting",
+    "activeTab"
   ],
   "background": {
     "service_worker": "background.js",
@@ -24,10 +25,17 @@
     "default_popup": "sidepanel.html?mode=popup"
   },
   "commands": {
+    "_execute_action": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+Y",
+        "mac": "Command+Shift+Y"
+      },
+      "description": "Open the Collections side panel"
+    },
     "add-current-tab": {
       "suggested_key": {
-        "default": "Ctrl+Shift+S",
-        "mac": "Command+Shift+S"
+        "default": "Alt+Shift+A",
+        "mac": "Alt+Shift+A"
       },
       "description": "Add the current tab to a collection"
     },

@@ -1,6 +1,9 @@
 # Packaged builds (generated separately)
 *.zip
 
+# Dependencies (dev-only, for the test suite)
+node_modules/
+
 # OS / editor cruft
 .DS_Store
 Thumbs.db

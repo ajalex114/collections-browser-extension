@@ -3,6 +3,9 @@ import { CollectionStore } from "./storage.js";
 const PARENT_ID = "collection-add-parent";
 const NEW_COLLECTION_ID = "collection-add-new";
 
+// Serializes context-menu rebuilds so overlapping triggers never interleave.
+let menuChain = Promise.resolve();
+
 // Lightweight logging so behavior is observable in the service-worker console
 // (edge://extensions → Collection → "service worker" / "Inspect views").
 const log = (...args) => console.log("[Collection][bg]", ...args);
@@ -33,15 +36,33 @@ async function applyPinPreference() {
   }
 }
 
+// Keep-alive: an alarm firing every ~30s resets the service-worker idle timer,
+// so the SW stays warm during active use and the *second* and later shortcut
+// presses in a session avoid a cold-start (the main cause of the 1–10s delay).
+// The alarm handler does a trivial storage touch and returns immediately.
+const KEEPALIVE_ALARM = "collection-keepalive";
+function ensureKeepAlive() {
+  chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 0.5 });
+}
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === KEEPALIVE_ALARM) {
+    // Touching storage is enough to keep the worker alive this cycle.
+    chrome.storage.local.get(CollectionStore.SETTINGS_KEY).catch(() => {});
+  }
+});
+ensureKeepAlive();
+
 // Open the side panel when the toolbar icon is clicked.
 chrome.runtime.onInstalled.addListener(() => {
   log("onInstalled");
+  ensureKeepAlive();
   applyPinPreference();
   rebuildMenus();
 });
 
 chrome.runtime.onStartup.addListener(() => {
   log("onStartup");
+  ensureKeepAlive();
   applyPinPreference();
   rebuildMenus();
 });
@@ -76,7 +97,9 @@ chrome.storage.onChanged.addListener((changes, area) => {
 // confirm or warn about a duplicate.
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.type !== "quick-save") return;
-  const tab = sender?.tab;
+  // The overlay runs as an extension page (not a content script), so it passes
+  // the target tab explicitly; fall back to sender.tab for any legacy caller.
+  const tab = msg.tab || sender?.tab;
   if (!tab || !tab.url) {
     sendResponse({ error: "no tab" });
     return;
@@ -101,7 +124,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
     const item = {
       type: "page",
-      title: tab.title || tab.url,
+      title: (msg.title && msg.title.trim()) || tab.title || tab.url,
       url: tab.url,
       favIconUrl: tab.favIconUrl || faviconFor(tab.url),
       sectionId,
@@ -140,14 +163,14 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   }
 });
 
-// Spotlight (page overlay) asks to open a collection in the side panel.
+// Spotlight (overlay window) asks to open a collection in the side panel.
 chrome.runtime.onMessage.addListener((msg, sender) => {
   if (msg?.type !== "open-collection") return;
   log("open-collection:", msg.collectionId);
   chrome.storage.local.set({
     focus_collection: { collectionId: msg.collectionId, at: Date.now() },
   });
-  const winId = sender?.tab?.windowId;
+  const winId = msg.windowId != null ? msg.windowId : sender?.tab?.windowId;
   if (winId != null) chrome.sidePanel.open({ windowId: winId }).catch(() => {});
 });
 
@@ -159,7 +182,20 @@ chrome.storage.onChanged.addListener((changes, area) => {
 });
 
 async function rebuildMenus() {
+  // Coalesce concurrent triggers (onInstalled + the migration's storage beacon
+  // can fire together). Two interleaved removeAll()/create() passes would leave
+  // a child pointing at a parent the other pass just wiped ("Cannot find menu
+  // item with id collection-add-parent").
+  menuChain = menuChain.then(doRebuildMenus, doRebuildMenus);
+  return menuChain;
+}
+
+async function doRebuildMenus() {
   const t0 = Date.now();
+  // Fetch BEFORE removeAll() so the parent and every child are created in one
+  // synchronous burst — no await between them — guaranteeing the parent exists
+  // before any child references it.
+  const collections = await CollectionStore.getCollections();
   await chrome.contextMenus.removeAll();
   const contexts = ["page", "link", "image", "selection"];
   chrome.contextMenus.create({
@@ -168,7 +204,6 @@ async function rebuildMenus() {
     contexts,
   });
 
-  const collections = await CollectionStore.getCollections();
   for (const col of collections) {
     chrome.contextMenus.create({
       id: `col:${col.id}`,
@@ -216,75 +251,104 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   }
 });
 
-// Keyboard shortcut: stash the active tab as a pending add, open the side panel,
-// and let the panel prompt the user for which collection to store it in.
+// Keyboard shortcuts open a centered overlay WINDOW (an extension page) rather
+// than injecting an overlay into the current page. This works everywhere —
+// including edge://, the Web Store, and IE-mode tabs — renders instantly (no
+// injection, no serialized args), and is immune to page-level keyboard handlers.
 const PENDING_KEY = "pending_add";
+const OVERLAY_CTX_KEY = "overlay_ctx";
+const OVERLAY_W = 640;
+const OVERLAY_H = { quicksave: 540, spotlight: 520 };
 
-chrome.commands.onCommand.addListener(async (command) => {
-  log("command:", command);
-  if (command === "add-current-tab") {
-    const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-    if (!tab || !tab.url) {
-      warn("add-current-tab: no active tab/url");
-      return;
-    }
-    const collections = await CollectionStore.getCollections();
-    const { theme } = await CollectionStore.getSettings();
-    if (tab.id != null) {
-      try {
-        await chrome.scripting.executeScript({
-          target: { tabId: tab.id },
-          func: quickSaveOverlay,
-          args: [collections, theme],
-        });
-        log("add-current-tab: injected quick-save picker into tab", tab.id);
-        return;
-      } catch (err) {
-        // Restricted pages (edge://, Web Store, …) block injection — fall back
-        // to the pending-add flow that opens the side panel to choose.
-        warn("add-current-tab: injection blocked, using side panel:", err?.message);
-      }
-    }
-    await chrome.storage.local.set({
-      [PENDING_KEY]: {
-        requestedAt: Date.now(),
-        item: {
-          type: "page",
-          title: tab.title || tab.url,
-          url: tab.url,
-          favIconUrl: tab.favIconUrl || faviconFor(tab.url),
-        },
-      },
-    });
-    log("add-current-tab: stashed pending add for", tab.url);
-    if (tab.windowId != null) {
-      chrome.sidePanel.open({ windowId: tab.windowId }).catch(() => {});
-    }
-    return;
+// Center an overlay of the given size over the user's focused browser window.
+async function openOverlayWindow(mode) {
+  const t0 = Date.now();
+  const [[tab], focused] = await Promise.all([
+    chrome.tabs.query({ active: true, lastFocusedWindow: true }),
+    chrome.windows.getLastFocused().catch(() => null),
+  ]);
+
+  // Hand the source tab to the overlay page (it reads collections itself).
+  await chrome.storage.session.set({
+    [OVERLAY_CTX_KEY]: {
+      mode,
+      tab: tab
+        ? {
+            id: tab.id,
+            url: tab.url,
+            title: tab.title,
+            favIconUrl: tab.favIconUrl || faviconFor(tab.url || ""),
+            windowId: tab.windowId,
+          }
+        : null,
+      at: Date.now(),
+    },
+  });
+
+  const w = OVERLAY_W;
+  const h = OVERLAY_H[mode] || 520;
+  const opts = {
+    url: chrome.runtime.getURL(`overlay.html?mode=${mode}`),
+    type: "popup",
+    width: w,
+    height: h,
+    focused: true,
+  };
+  if (focused && focused.width) {
+    opts.left = Math.max(0, Math.round(focused.left + (focused.width - w) / 2));
+    // Sit in the upper third, echoing the old spotlight placement.
+    opts.top = Math.max(0, Math.round(focused.top + (focused.height - h) / 3));
   }
+  try {
+    await chrome.windows.create(opts);
+    log(mode, "overlay window opened in", Date.now() - t0, "ms");
+  } catch (err) {
+    warn(mode, "overlay window failed:", err?.message);
+  }
+}
 
-  if (command === "spotlight-search") {
-    const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-    if (!tab || tab.id == null) {
-      warn("spotlight-search: no active tab");
-      return;
-    }
-    const collections = await CollectionStore.getCollections();
-    const { theme } = await CollectionStore.getSettings();
+// Whether a page can host an injected overlay. Restricted surfaces (edge://,
+// the Web Store, view-source, extension pages, IE-mode) reject scripting; those
+// fall back to a framed overlay window.
+function isInjectablePage(url) {
+  if (!url) return false;
+  return /^https?:\/\//i.test(url) || /^file:\/\//i.test(url);
+}
+
+// Open the picker/spotlight: prefer a frameless in-page overlay (injected into
+// the active tab), and fall back to a centered overlay WINDOW on pages that
+// disallow injection. The in-page path gives a frameless, page-blurring UI on
+// ~99% of pages; the window path guarantees it still works everywhere else.
+async function openOverlay(mode) {
+  const t0 = Date.now();
+  const func = mode === "spotlight" ? spotlightOverlay : quickSaveOverlay;
+  let tab = null;
+  try {
+    [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+  } catch (_) {}
+
+  if (tab && tab.id != null && isInjectablePage(tab.url)) {
     try {
+      const { collections, settings } = await CollectionStore.getSnapshot();
+      const theme = (settings && settings.theme) || "system";
       await chrome.scripting.executeScript({
         target: { tabId: tab.id },
-        func: spotlightOverlay,
+        func,
         args: [collections, theme],
       });
-      log("spotlight-search: injected overlay into tab", tab.id, "theme", theme);
+      log(mode, "in-page overlay injected in", Date.now() - t0, "ms");
+      return;
     } catch (err) {
-      // Some pages (e.g. edge://, the Web Store) disallow injection — fall back
-      // to opening the side panel so search is still reachable.
-      warn("spotlight-search: injection blocked, opening side panel:", err?.message);
-      if (tab.windowId != null) chrome.sidePanel.open({ windowId: tab.windowId }).catch(() => {});
+      warn(mode, "injection failed, falling back to window:", err?.message);
     }
   }
+  await openOverlayWindow(mode);
+}
+
+chrome.commands.onCommand.addListener((command) => {
+  log("command:", command);
+  if (command === "add-current-tab") openOverlay("quicksave");
+  else if (command === "spotlight-search") openOverlay("spotlight");
 });
 
 // Injected into the active page to render a full-window spotlight search. Runs
@@ -573,10 +637,25 @@ function quickSaveOverlay(collections, theme) {
     ".inline-input{width:calc(100% - 8px);margin:2px 4px;padding:9px 11px;border-radius:10px;" +
     "border:1px solid " + c.selBg + ";background:" + c.cardBg + ";color:" + c.text + ";" +
     "font-size:14px;outline:none;}" +
+    ".field-label{font-size:11px;letter-spacing:0.06em;text-transform:uppercase;color:" + c.dim + ";" +
+    "margin-bottom:5px;display:block;}" +
+    ".field{width:100%;padding:9px 12px;border-radius:10px;border:1px solid " + c.border + ";" +
+    "background:" + c.cardBg + ";color:" + c.text + ";font-size:14px;outline:none;}" +
+    ".field:focus{border-color:" + c.selBg + ";}" +
+    ".search{position:relative;margin-top:10px;}" +
+    ".search .field{padding-left:34px;}" +
+    ".search .mag{position:absolute;left:12px;top:50%;transform:translateY(-50%);" +
+    "color:" + c.dim + ";font-size:13px;pointer-events:none;}" +
     "</style>" +
     "<div class='backdrop'>" +
     "<div class='card'>" +
-    "<div class='head'>Save <b class='pg'></b> to…</div>" +
+    "<div class='head'>" +
+    "<label class='field-label' for='qs-title'>Save as</label>" +
+    "<input class='field' id='qs-title' type='text' aria-label='Item name' />" +
+    "<div class='search'><span class='mag' aria-hidden='true'>🔍</span>" +
+    "<input class='field' id='qs-search' type='text' " +
+    "placeholder='Search collections & sections…' aria-label='Search collections and sections' /></div>" +
+    "</div>" +
     "<div class='body'>" +
     "<div class='col' role='listbox' aria-label='Collections' id='qs-cols'></div>" +
     "<div class='sec' role='listbox' aria-label='Sections' id='qs-secs'></div>" +
@@ -588,10 +667,14 @@ function quickSaveOverlay(collections, theme) {
   (document.body || document.documentElement).appendChild(host);
 
   const backdrop = shadow.querySelector(".backdrop");
-  shadow.querySelector(".pg").textContent = "“" + (document.title || location.href) + "”";
   const colWrap = shadow.getElementById("qs-cols");
   const secWrap = shadow.getElementById("qs-secs");
   const statusEl = shadow.querySelector(".status");
+  const titleInput = shadow.getElementById("qs-title");
+  const searchInput = shadow.getElementById("qs-search");
+  titleInput.value = document.title || location.href || "";
+  let query = "";
+  let visibleCols = collections.slice();
 
   function close() {
     host.remove();
@@ -600,8 +683,9 @@ function quickSaveOverlay(collections, theme) {
 
   function commit(payload, label) {
     statusEl.textContent = "Saving…";
+    const title = (titleInput.value || "").trim();
     chrome.runtime.sendMessage(
-      Object.assign({ type: "quick-save" }, payload),
+      Object.assign({ type: "quick-save", title: title || undefined }, payload),
       (resp) => {
         if (resp && resp.duplicate) {
           statusEl.textContent = "Already in this collection — pick another";
@@ -619,6 +703,18 @@ function quickSaveOverlay(collections, theme) {
 
   function save(collectionId, sectionId, label) {
     commit({ collectionId, sectionId: sectionId || null }, label);
+  }
+
+  // Save into the current selection (used by Enter from the search box / list).
+  function saveCurrent() {
+    const col = curCol();
+    if (!col) return;
+    if (zone === "sec") {
+      const opt = curSecOptions[secIdx];
+      if (opt) save(col.id, opt.sectionId, opt.label);
+    } else {
+      save(col.id, null, col.name || "collection");
+    }
   }
 
   // Swap a "＋ New…" row for an inline text input. Enter OR clicking elsewhere
@@ -657,6 +753,10 @@ function quickSaveOverlay(collections, theme) {
     input.focus();
   }
 
+  function curCol() {
+    return visibleCols[colIdx];
+  }
+
   // Create a collection and keep the picker open, selecting the new collection
   // so the user can then pick/create a section or click to save into it.
   function createCollection(name) {
@@ -667,9 +767,12 @@ function quickSaveOverlay(collections, theme) {
         return;
       }
       collections.push({ id: resp.collection.id, name: resp.collection.name, sections: [], items: [] });
-      colIdx = collections.length - 1;
+      query = "";
+      searchInput.value = "";
       zone = "col";
       renderCollections();
+      colIdx = visibleCols.findIndex((col) => col.id === resp.collection.id);
+      if (colIdx < 0) colIdx = visibleCols.length - 1;
       renderSections();
       paintSel();
       statusEl.textContent = "Created “" + resp.collection.name + "”";
@@ -681,7 +784,7 @@ function quickSaveOverlay(collections, theme) {
   // Create a section in the current collection and keep the picker open,
   // selecting the new section.
   function createSection(title) {
-    const col = collections[colIdx];
+    const col = curCol();
     if (!col) return;
     statusEl.textContent = "Adding section…";
     chrome.runtime.sendMessage({ type: "create-section", collectionId: col.id, title }, (resp) => {
@@ -691,6 +794,8 @@ function quickSaveOverlay(collections, theme) {
       }
       if (!Array.isArray(col.sections)) col.sections = [];
       col.sections.push({ id: resp.section.id, title: resp.section.title });
+      query = "";
+      searchInput.value = "";
       zone = "sec";
       renderCollections();
       renderSections();
@@ -709,7 +814,7 @@ function quickSaveOverlay(collections, theme) {
   let curSecOptions = []; // [{sectionId, label}]
 
   function renderSections() {
-    const col = collections[colIdx];
+    const col = curCol();
     secWrap.innerHTML = "";
     if (!col) return;
     const title = document.createElement("div");
@@ -717,8 +822,16 @@ function quickSaveOverlay(collections, theme) {
     title.textContent = col.name || "Untitled";
     secWrap.appendChild(title);
 
+    // When searching and the collection matched only via a section name, narrow
+    // to matching sections; if the collection name matched, show all sections.
+    const colMatches = !query || (col.name || "").toLowerCase().includes(query);
+    let secs = col.sections || [];
+    if (query && !colMatches) {
+      secs = secs.filter((s) => (s.title || "").toLowerCase().includes(query));
+    }
+
     curSecOptions = [{ sectionId: null, label: "Top of " + (col.name || "collection") }];
-    for (const s of col.sections || []) curSecOptions.push({ sectionId: s.id, label: s.title });
+    for (const s of secs) curSecOptions.push({ sectionId: s.id, label: s.title });
 
     curSecOptions.forEach((opt, i) => {
       const row = document.createElement("div");
@@ -732,7 +845,7 @@ function quickSaveOverlay(collections, theme) {
         secIdx = i;
         paintSel();
       });
-      row.addEventListener("click", () => save(collections[colIdx].id, opt.sectionId, opt.label));
+      row.addEventListener("click", () => save(col.id, opt.sectionId, opt.label));
       secWrap.appendChild(row);
     });
 
@@ -747,9 +860,25 @@ function quickSaveOverlay(collections, theme) {
     paintSel();
   }
 
+  function collectionMatches(col) {
+    if (!query) return true;
+    if ((col.name || "").toLowerCase().includes(query)) return true;
+    return (col.sections || []).some((s) => (s.title || "").toLowerCase().includes(query));
+  }
+
   function renderCollections() {
     colWrap.innerHTML = "";
-    collections.forEach((col, i) => {
+    visibleCols = collections.filter(collectionMatches);
+    if (colIdx >= visibleCols.length) colIdx = Math.max(0, visibleCols.length - 1);
+
+    if (query && !visibleCols.length) {
+      const em = document.createElement("div");
+      em.className = "empty";
+      em.textContent = "No matches";
+      colWrap.appendChild(em);
+    }
+
+    visibleCols.forEach((col, i) => {
       const row = document.createElement("div");
       row.className = "row";
       row.setAttribute("role", "option");
@@ -808,11 +937,95 @@ function quickSaveOverlay(collections, theme) {
   renderSections();
   paintSel();
 
+  // Move keyboard focus from the "Save as" field into the collection list so
+  // arrow keys resume navigating collections/sections.
+  function focusList() {
+    if (!visibleCols.length) {
+      const nr = colWrap.querySelector(".newrow");
+      if (nr) nr.focus();
+      return;
+    }
+    zone = "col";
+    if (colIdx < 0 || colIdx >= visibleCols.length) colIdx = 0;
+    paintSel();
+    const rows = colWrap.querySelectorAll(".row");
+    if (rows[colIdx]) rows[colIdx].focus();
+  }
+
+  // Live filter as the user types in the search box.
+  searchInput.addEventListener("input", () => {
+    query = (searchInput.value || "").trim().toLowerCase();
+    colIdx = 0;
+    zone = "col";
+    renderCollections();
+    renderSections();
+    paintSel();
+  });
+
+  // Keep page-level single-key shortcuts from swallowing text input.
+  [searchInput, titleInput].forEach((inp) => {
+    inp.addEventListener("keypress", (e) => e.stopPropagation());
+    inp.addEventListener("keyup", (e) => e.stopPropagation());
+  });
+
   host.addEventListener("keydown", (e) => {
-    e.stopPropagation();
     const ae = shadow.activeElement;
-    // Let inline text inputs handle their own keys (typing a new name).
-    if (ae && ae.tagName === "INPUT") return;
+    // Inline "New…" text inputs fully own their keys (Enter commits, Esc
+    // cancels). Return BEFORE stopPropagation so their own handlers still run.
+    if (ae && ae.classList && ae.classList.contains("inline-input")) return;
+    e.stopPropagation();
+    // "Save as" name field: Left/Right/Home/End edit the text as usual; Tab or
+    // ArrowDown hands focus back to the collection/section list.
+    if (ae === titleInput) {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        close();
+      } else if (e.key === "Enter") {
+        e.preventDefault();
+        saveCurrent();
+      } else if (e.key === "ArrowDown" || (e.key === "Tab" && !e.shiftKey)) {
+        e.preventDefault();
+        focusList();
+      }
+      return;
+    }
+    // Search field: typing filters; arrows drive list navigation.
+    if (ae === searchInput) {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        close();
+      } else if (e.key === "Enter") {
+        e.preventDefault();
+        saveCurrent();
+      } else if (e.key === "ArrowDown") {
+        e.preventDefault();
+        if (zone === "col") {
+          if (!visibleCols.length) return;
+          colIdx = (colIdx + 1) % visibleCols.length;
+          renderSections();
+        } else secIdx = (secIdx + 1) % curSecOptions.length;
+        paintSel();
+      } else if (e.key === "ArrowUp") {
+        e.preventDefault();
+        if (zone === "col") {
+          if (!visibleCols.length) return;
+          colIdx = (colIdx - 1 + visibleCols.length) % visibleCols.length;
+          renderSections();
+        } else secIdx = (secIdx - 1 + curSecOptions.length) % curSecOptions.length;
+        paintSel();
+      } else if (e.key === "ArrowRight") {
+        e.preventDefault();
+        if (!visibleCols.length) return;
+        zone = "sec";
+        secIdx = 0;
+        paintSel();
+      } else if (e.key === "ArrowLeft") {
+        e.preventDefault();
+        zone = "col";
+        paintSel();
+      }
+      return;
+    }
     // On a "＋ New…" row, Enter/Space opens its inline input.
     if (ae && ae.classList && ae.classList.contains("newrow")) {
       if (e.key === "Enter" || e.key === " ") {
@@ -820,6 +1033,18 @@ function quickSaveOverlay(collections, theme) {
         ae.click();
         return;
       }
+    }
+    // Focus is on the list (not the "Save as" field): typing any printable
+    // character (or Backspace) routes into the search box so the user can just
+    // start typing to filter, without clicking the search field first.
+    if (!e.ctrlKey && !e.metaKey && !e.altKey &&
+        (e.key.length === 1 || e.key === "Backspace")) {
+      e.preventDefault();
+      searchInput.focus();
+      if (e.key === "Backspace") searchInput.value = searchInput.value.slice(0, -1);
+      else searchInput.value += e.key;
+      searchInput.dispatchEvent(new Event("input"));
+      return;
     }
     if (e.key === "Escape") {
       if (zone === "sec") {
@@ -830,22 +1055,22 @@ function quickSaveOverlay(collections, theme) {
     } else if (e.key === "ArrowDown") {
       e.preventDefault();
       if (zone === "col") {
-        if (!collections.length) return;
-        colIdx = (colIdx + 1) % collections.length;
+        if (!visibleCols.length) return;
+        colIdx = (colIdx + 1) % visibleCols.length;
         renderSections();
       } else secIdx = (secIdx + 1) % curSecOptions.length;
       paintSel();
     } else if (e.key === "ArrowUp") {
       e.preventDefault();
       if (zone === "col") {
-        if (!collections.length) return;
-        colIdx = (colIdx - 1 + collections.length) % collections.length;
+        if (!visibleCols.length) return;
+        colIdx = (colIdx - 1 + visibleCols.length) % visibleCols.length;
         renderSections();
       } else secIdx = (secIdx - 1 + curSecOptions.length) % curSecOptions.length;
       paintSel();
     } else if (e.key === "ArrowRight") {
       e.preventDefault();
-      if (!collections.length) return;
+      if (!visibleCols.length) return;
       zone = "sec";
       secIdx = 0;
       paintSel();
@@ -855,14 +1080,7 @@ function quickSaveOverlay(collections, theme) {
       paintSel();
     } else if (e.key === "Enter") {
       e.preventDefault();
-      const col = collections[colIdx];
-      if (!col) return;
-      if (zone === "sec") {
-        const opt = curSecOptions[secIdx];
-        save(col.id, opt.sectionId, opt.label);
-      } else {
-        save(col.id, null, col.name || "collection");
-      }
+      saveCurrent();
     }
   }, true);
   // Backdrop lives inside the shadow root, so its click target is reliable
@@ -871,9 +1089,7 @@ function quickSaveOverlay(collections, theme) {
     if (e.target === backdrop) close();
   });
   host.tabIndex = -1;
-  const firstFocus = colWrap.querySelector(".row") || colWrap.querySelector(".newrow");
-  if (firstFocus) firstFocus.focus();
-  else host.focus();
+  searchInput.focus();
 }
 
 function buildItemFromContext(info, tab) {

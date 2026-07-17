@@ -52,9 +52,21 @@ or its behavior changes.
 4. The side panel opens to show the result.
 
 ### Add current tab via keyboard shortcut
-1. Press **Ctrl+Shift+S** (macOS: **Cmd+Shift+S**) on any page.
-2. A centered **Save to…** picker appears over the middle of the page (like the
-   spotlight), blurring the rest of the window. It lists your collections.
+1. Press **Alt+Shift+A** on any page.
+2. A centered **Save to…** picker opens over the browser. On regular web pages it
+   is a **frameless in-page overlay** (injected into the current tab, no OS title
+   bar, and it dims the page behind it); on pages that don't allow injection
+   (`edge://`, the Web Store, `view-source:`, IE-mode tabs) it automatically falls
+   back to a small **extension window**. Either way it opens centered and behaves
+   identically. At the top is an editable **Save as** field (pre-filled with the
+   page title) and a **search box**; below are your collections.
+   - **Save as:** edit the field to change the name the item is stored under
+     without affecting the page itself. Press **Enter** in this field to save to
+     the current selection.
+   - **Search:** type to filter the list live by **collection name or section
+     name**. Collections that match — directly, or because one of their sections
+     matches — stay visible, and a matching collection's section pane is narrowed
+     to the matching sections. Clearing the box restores the full list.
 3. **Hover** (or arrow to) a collection to reveal its sections on the right.
    **Click the collection** to save the page to the **top** of that collection;
    **click a section** (or the **↑ Top of…** option) to save it there — a single
@@ -66,33 +78,38 @@ or its behavior changes.
      click it (or the item within) to save the page — or add a section to a new
      collection first. Press **Esc** in the box to cancel. (With no collections
      yet, the picker opens straight to the new-collection box.)
-4. Keyboard: **↑/↓** move within the current pane, **→** jumps to the sections
-   pane, **←** returns to collections, **Enter** saves the current selection,
-   **Esc** backs out of the sections pane or closes the picker.
+4. Keyboard: focus starts in the search box; **↑/↓** move within the current
+   pane, **→** jumps to the sections pane, **←** returns to collections,
+   **Enter** saves the current selection, **Esc** backs out of the sections pane
+   or closes the picker. Clicking away (window loses focus) also closes it.
+   In the **Save as** name field, **←/→** (and Home/End) edit the text as usual;
+   press **Tab** or **↓** to hand focus back to the collection/section list.
+   When focus is on the list (not the name field), just start typing — any
+   printable key (or Backspace) is routed into the search box and filters live.
 5. If the page's URL is already in the chosen collection it is not added again —
    an "Already in this collection" message is shown and the picker stays open so
-   you can choose another.
-6. On restricted pages (e.g. `edge://`, the Web Store) where the overlay can't be
-   injected, it falls back to opening the side panel with an **Add current tab
-   to…** dialog. The shortcut can be remapped at `edge://extensions/shortcuts`.
+   you can choose another. The shortcut can be remapped at
+   `edge://extensions/shortcuts`.
 
 ### Spotlight search
 1. Press **Ctrl+Space** on any page.
-2. A search popup appears centered over the **entire browser window**, blurring
-   the page behind it (injected into the active tab). It follows the extension's
-   **theme** setting (System/Light/Dark) so it matches the collections UI.
-3. Type to search across all collections. Typing works reliably even on sites
-   with single-key keyboard shortcuts (keystrokes are isolated from the page).
-   Each result shows the item title and, below it, its **collection - section**
-   (the `- section` is omitted when the item isn't in a section). Searching a
-   **collection name** or **section name** lists every item within it.
+2. A search popup opens centered over the browser. On regular web pages it is a
+   **frameless in-page overlay** (injected into the current tab, dimming the page
+   behind it); on pages that block injection (`edge://`, the Web Store,
+   `view-source:`, IE-mode tabs) it falls back to a small **extension window**. It
+   follows the extension's **theme** setting (System/Light/Dark) so it matches the
+   collections UI.
+3. Type to search across all collections. In the in-page overlay, keystrokes are
+   isolated from the page so typing is never intercepted by page shortcuts. Each
+   result shows the
+   item title and, below it, its **collection - section** (the `- section` is
+   omitted when the item isn't in a section). Searching a **collection name** or
+   **section name** lists every item within it.
 4. Use **↑/↓** to move the selection. **Enter** opens the highlighted result in
-   the **current tab**; **Ctrl/Cmd+Enter** opens it in a **new tab**. Clicking a
+   the **original tab**; **Ctrl/Cmd+Enter** opens it in a **new tab**. Clicking a
    result opens it (Ctrl/Cmd-click for a new tab). A note or whole-collection
-   match opens that collection in the side panel instead. **Esc** or a backdrop
-   click closes.
-5. On pages that block script injection (e.g. `edge://` pages, the Web Store),
-   the side panel opens instead so search stays reachable.
+   match opens that collection in the side panel instead. **Esc** or clicking
+   away (window loses focus) closes it.
 
 ### Cross-collection search (list view)
 - The search bar in the list view matches item titles, URLs, notes, and also
@@ -156,7 +173,8 @@ count badge, followed by the items beneath it — matching a clean, grouped list
    persists.
 
 ### Pin panel
-- Default is **unpinned**: clicking the toolbar icon opens Collections as a
+- Default is **unpinned**: clicking the toolbar icon — or pressing
+  **Ctrl+Shift+Y** (macOS: **Cmd+Shift+Y**) — opens Collections as a
   **popup** (420×600) that hangs from the toolbar icon (like a typical
   extension).
 - Click the **📌 Pin** button (or the Settings checkbox) to **pin** it: the view
@@ -184,9 +202,10 @@ count badge, followed by the items beneath it — matching a clean, grouped list
 
 ## Logging
 - Both the service worker and the side panel log key actions with a
-  `[Collection]` prefix (mutations, commands, spotlight injection, theme/pin
+  `[Collection]` prefix (mutations, commands, overlay windows, theme/pin
   changes, errors). View them at `edge://extensions` → Collection → *service
-  worker* (background) or by inspecting the side panel (panel).
+  worker* (background), by inspecting the side panel (panel), or by inspecting
+  the overlay window itself (spotlight / quick-save).
   within the collection; the new order is saved on drop.
 
 ## Search
@@ -221,5 +240,17 @@ count badge, followed by the items beneath it — matching a clean, grouped list
 3. Imported collections appear in the list.
 
 ## Storage & privacy
-- All data is stored in `chrome.storage.local` only.
-- No network requests, telemetry, or third-party code.
+- Collections are stored locally in **IndexedDB** (`collections_db`), one record
+  per collection — so a save rewrites only the affected collection, and images
+  can be kept without bloating a single blob.
+- A lightweight **revision beacon** in `chrome.storage.local` (`collections_data`)
+  notifies all views (side panel, popup, overlays) when data changes.
+- **Cross-device sync (Edge/Chrome):** a text-only projection of each collection
+  (links, titles, notes, sections — no images) is mirrored to
+  `chrome.storage.sync`, so collections follow you across devices signed into the
+  same browser account. Sync is Edge↔Edge and Chrome↔Chrome only (each browser
+  uses its own account); it does not bridge Edge↔Chrome. Images/thumbnails stay
+  local. Collections too large for the sync quota remain local-only.
+- Conflicts resolve last-write-wins; deletes propagate via tombstones.
+- No network requests, telemetry, or third-party code — the browser performs all
+  syncing; the extension only reads/writes storage APIs.
