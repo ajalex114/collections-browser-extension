@@ -1,4 +1,5 @@
 import { CollectionStore } from "./storage.js";
+import { ITEM_BUDGET_BYTES, collectionSyncBytes } from "./limits.js";
 
 // Boot timing: helps diagnose slow first-open. Durations print to the panel
 // devtools console as "[Collection][perf] …". T0 is module-evaluation start.
@@ -42,6 +43,7 @@ const state = {
 // --- View switching --------------------------------------------------------
 
 function showList() {
+  cancelPendingMount(); // stop mounting into the now-hidden detail list
   state.currentCollectionId = null;
   $("#detail-view").classList.add("hidden");
   $("#list-view").classList.remove("hidden");
@@ -65,14 +67,14 @@ function showDetail(collectionId) {
 // --- Rendering: list -------------------------------------------------------
 
 async function renderList() {
-  const collections = await Store.getCollections();
+  const summaries = await Store.getSummaries();
   const list = $("#collections-list");
   list.innerHTML = "";
 
-  $("#empty-collections").classList.toggle("hidden", collections.length > 0);
+  $("#empty-collections").classList.toggle("hidden", summaries.length > 0);
 
-  for (const col of collections) {
-    list.appendChild(collectionCard(col));
+  for (const sum of summaries) {
+    list.appendChild(collectionCard(sum));
   }
 }
 
@@ -87,12 +89,12 @@ function collectionCard(col) {
 
   const thumbs = document.createElement("div");
   thumbs.className = "collection-thumbs";
-  const previewItems = col.items.slice(0, 4);
+  const preview = col.preview || [];
   for (let i = 0; i < 4; i++) {
-    const it = previewItems[i];
-    if (it && (it.favIconUrl || it.imageUrl)) {
+    const src = preview[i];
+    if (src) {
       const img = document.createElement("img");
-      img.src = it.imageUrl || it.favIconUrl;
+      img.src = src;
       img.onerror = () => (img.style.visibility = "hidden");
       thumbs.appendChild(img);
     } else {
@@ -109,8 +111,9 @@ function collectionCard(col) {
   name.textContent = col.name;
   const count = document.createElement("div");
   count.className = "count";
-  const secN = (col.sections || []).length;
-  const itemLabel = `${col.items.length} item${col.items.length === 1 ? "" : "s"}`;
+  const secN = col.sectionCount || 0;
+  const itemN = col.itemCount || 0;
+  const itemLabel = `${itemN} item${itemN === 1 ? "" : "s"}`;
   count.textContent = secN
     ? `${secN} section${secN === 1 ? "" : "s"} · ${itemLabel}`
     : itemLabel;
@@ -142,8 +145,10 @@ function collectionCard(col) {
 // --- Rendering: detail -----------------------------------------------------
 
 async function renderDetail() {
-  const collections = await Store.getCollections();
-  const col = collections.find((c) => c.id === state.currentCollectionId);
+  const token = ++detailRenderToken;
+  cancelPendingMount(); // abandon any in-flight mount from a previous render
+  const col = await Store.getCollection(state.currentCollectionId);
+  if (token !== detailRenderToken) return; // superseded while awaiting the read
   if (!col) {
     showList();
     return;
@@ -152,22 +157,105 @@ async function renderDetail() {
   $("#collection-name-input").value = col.name;
 
   const sections = col.sections || [];
-  const ungrouped = col.items.filter((i) => !i.sectionId);
+
+  // Group items in one pass. Items keep document order within their bucket;
+  // an item whose sectionId matches no live section is dropped (as before).
+  const ungrouped = [];
+  const bySection = new Map(sections.map((s) => [s.id, []]));
+  for (const item of col.items) {
+    if (!item.sectionId) {
+      ungrouped.push(item);
+      continue;
+    }
+    const bucket = bySection.get(item.sectionId);
+    if (bucket) bucket.push(item);
+  }
 
   const list = $("#items-list");
   list.innerHTML = "";
-  for (const item of ungrouped) list.appendChild(itemCard(item));
-
   const sectionsWrap = $("#sections-container");
   sectionsWrap.innerHTML = "";
+
+  // Build the structure (section headers + empty item lists) synchronously so
+  // section drag targets exist immediately, and collect every item card into a
+  // single ordered mount queue. The queue is drained first-screenful-now, rest
+  // in animation-frame batches — so opening a huge collection stays responsive
+  // without changing the final DOM.
+  const tasks = [];
+  for (const item of ungrouped) tasks.push({ container: list, item });
   for (const section of sections) {
-    const items = col.items.filter((i) => i.sectionId === section.id);
-    sectionsWrap.appendChild(sectionBox(section, items));
+    const items = bySection.get(section.id);
+    const { box, ul } = sectionBox(section, items);
+    sectionsWrap.appendChild(box);
+    for (const item of items) tasks.push({ container: ul, item });
   }
 
   const isEmpty = col.items.length === 0 && sections.length === 0;
   $("#empty-items").classList.toggle("hidden", !isEmpty);
   $("#add-section").classList.remove("hidden");
+
+  // Warn (and, via the domain hard-stop, block) once this collection is at the
+  // per-collection sync size limit. Shown from ~600 bytes short of the ceiling
+  // so the user sees it before the next add is refused.
+  const banner = $("#detail-limit-banner");
+  const full = collectionSyncBytes(col) >= ITEM_BUDGET_BYTES - 600;
+  banner.classList.toggle("hidden", !full);
+
+  mountTasks(tasks, token);
+}
+
+// --- Incremental item mounting ---------------------------------------------
+// Opening a collection builds one DOM node per item. For large collections that
+// synchronous burst is the dominant cost, so we render the first screenful
+// immediately and append the remainder in animation-frame batches. Every card
+// still ends up in the DOM, so drag-and-drop and persistItemLayout (which read
+// the whole list) are unaffected — but any operation that must see the complete
+// list first calls flushPendingMount() to finish synchronously.
+const FIRST_CHUNK = 30; // rendered synchronously — more than one viewport of cards
+const MOUNT_BATCH = 60; // appended per animation frame thereafter
+let detailRenderToken = 0;
+let pendingMount = null; // { token, tasks, i, rafId } | null
+
+function mountTasks(tasks, token) {
+  let i = 0;
+  const first = Math.min(FIRST_CHUNK, tasks.length);
+  for (; i < first; i++) tasks[i].container.appendChild(itemCard(tasks[i].item));
+  if (i >= tasks.length) {
+    pendingMount = null;
+    return;
+  }
+  pendingMount = { token, tasks, i, rafId: 0 };
+  const step = () => {
+    if (!pendingMount || pendingMount.token !== token) return; // superseded
+    const end = Math.min(pendingMount.i + MOUNT_BATCH, tasks.length);
+    for (let k = pendingMount.i; k < end; k++) {
+      tasks[k].container.appendChild(itemCard(tasks[k].item));
+    }
+    pendingMount.i = end;
+    if (end >= tasks.length) {
+      pendingMount = null;
+      return;
+    }
+    pendingMount.rafId = requestAnimationFrame(step);
+  };
+  pendingMount.rafId = requestAnimationFrame(step);
+}
+
+function cancelPendingMount() {
+  if (pendingMount && pendingMount.rafId) cancelAnimationFrame(pendingMount.rafId);
+  pendingMount = null;
+}
+
+// Synchronously append every not-yet-mounted card. Call before any operation
+// that reads the full item DOM (drag start, layout persist) so it never sees a
+// partially populated list.
+function flushPendingMount() {
+  if (!pendingMount) return;
+  const { tasks, i } = pendingMount;
+  cancelPendingMount();
+  for (let k = i; k < tasks.length; k++) {
+    tasks[k].container.appendChild(itemCard(tasks[k].item));
+  }
 }
 
 function sectionBox(section, items) {
@@ -220,9 +308,11 @@ function sectionBox(section, items) {
   const ul = document.createElement("ul");
   ul.className = "items-list section-items item-container";
   ul.dataset.sectionId = section.id;
-  for (const item of items) ul.appendChild(itemCard(item));
   attachItemContainer(ul);
 
+  // Item cards are appended by the caller's incremental mount queue. Show the
+  // "drop here" hint only when the section is genuinely empty (known up front
+  // from the item count, not from the DOM which fills in asynchronously).
   if (items.length === 0) {
     const hint = document.createElement("div");
     hint.className = "section-empty hint";
@@ -231,7 +321,7 @@ function sectionBox(section, items) {
   }
 
   box.append(header, ul);
-  return box;
+  return { box, ul };
 }
 
 async function addSection() {
@@ -436,6 +526,9 @@ let dragItemEl = null;
 
 function attachItemDrag(el) {
   el.addEventListener("dragstart", (e) => {
+    // Ensure every card exists before a reorder begins — the drop logic and
+    // persistItemLayout enumerate the whole list.
+    flushPendingMount();
     dragItemEl = el;
     el.classList.add("dragging");
     if (e.dataTransfer) e.dataTransfer.effectAllowed = "move";
@@ -469,6 +562,7 @@ function getDragAfterElement(container, y) {
 }
 
 async function persistItemLayout() {
+  flushPendingMount(); // never persist a partially mounted list
   const entries = [];
   for (const container of document.querySelectorAll("#detail-view .item-container")) {
     const sectionId = container.dataset.sectionId || null;
@@ -543,6 +637,7 @@ async function addCurrentPage() {
     url: tab.url,
     favIconUrl: tab.favIconUrl || faviconFor(tab.url),
   });
+  if (handledLimit(res)) return;
   if (res && res.duplicate) {
     toast("Already in this collection");
     return;
@@ -552,7 +647,8 @@ async function addCurrentPage() {
 }
 
 async function addNote() {
-  await Store.addItem(state.currentCollectionId, { type: "note", note: "" });
+  const res = await Store.addItem(state.currentCollectionId, { type: "note", note: "" });
+  if (handledLimit(res)) return;
   await renderDetail();
   // Immediately open the newly-added (last) note for editing.
   const last = $("#items-list").lastElementChild;
@@ -562,11 +658,12 @@ async function addNote() {
 async function addImageByUrl() {
   const url = prompt("Image URL:");
   if (!url) return;
-  await Store.addItem(state.currentCollectionId, {
+  const res = await Store.addItem(state.currentCollectionId, {
     type: "image",
     imageUrl: url.trim(),
     title: "Image",
   });
+  if (handledLimit(res)) return;
   renderDetail();
 }
 
@@ -604,6 +701,7 @@ async function addSelectedTabs() {
   const checked = [...$("#tabs-picker").querySelectorAll("input:checked")];
   let added = 0;
   let skipped = 0;
+  let limited = false;
   for (const cb of checked) {
     const li = cb.closest("li");
     const res = await Store.addItem(state.currentCollectionId, {
@@ -612,11 +710,19 @@ async function addSelectedTabs() {
       url: li.dataset.url,
       favIconUrl: li.dataset.favicon || faviconFor(li.dataset.url),
     });
+    if (res && res.limit) {
+      limited = true;
+      break; // collection/storage full — stop before creating unsyncable data
+    }
     if (res && res.duplicate) skipped++;
     else added++;
   }
   $("#tabs-modal").classList.add("hidden");
   renderDetail();
+  if (limited) {
+    toast(limitMessage("collection"));
+    return;
+  }
   const suffix = skipped ? ` (${skipped} already present)` : "";
   toast(`Added ${added} tab${added === 1 ? "" : "s"}${suffix}`);
 }
@@ -624,8 +730,7 @@ async function addSelectedTabs() {
 // --- Collection-level actions ----------------------------------------------
 
 async function openAllLinks() {
-  const collections = await Store.getCollections();
-  const col = collections.find((c) => c.id === state.currentCollectionId);
+  const col = await Store.getCollection(state.currentCollectionId);
   if (!col) return;
   const urls = col.items.filter((i) => i.type !== "note" && i.url).map((i) => i.url);
   for (const url of urls) chrome.tabs.create({ url, active: false });
@@ -633,8 +738,7 @@ async function openAllLinks() {
 }
 
 async function copyAll() {
-  const collections = await Store.getCollections();
-  const col = collections.find((c) => c.id === state.currentCollectionId);
+  const col = await Store.getCollection(state.currentCollectionId);
   if (!col) return;
   const lines = col.items.map((i) => {
     if (i.type === "note") return i.note;
@@ -677,6 +781,12 @@ async function findMatches(query) {
     if (nameMatch && !itemMatched) matches.push({ col, item: null });
   }
   return matches;
+}
+
+let searchTimer;
+function debouncedSearch(rawQuery) {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => runSearch(rawQuery), 75);
 }
 
 async function runSearch(rawQuery) {
@@ -767,24 +877,34 @@ async function renderPickCollections() {
   $("#pick-modal .modal-card h2").textContent = "Add current tab to…";
   const list = $("#pick-list");
   list.innerHTML = "";
-  const collections = await Store.getCollections();
-  if (collections.length === 0) {
+  const summaries = await Store.getSummaries();
+  if (summaries.length === 0) {
     const hint = document.createElement("div");
     hint.className = "hint";
     hint.textContent = "No collections yet — create one below.";
     list.appendChild(hint);
   }
-  for (const col of collections) {
+  for (const sum of summaries) {
     const li = document.createElement("li");
     li.className = "pick-item";
-    li.textContent = col.name;
-    li.addEventListener("click", () => choosePickCollection(col));
+    li.textContent = sum.name;
+    li.addEventListener("click", () => choosePickCollection(sum));
     list.appendChild(li);
   }
 }
 
-// Step 2 (only when the collection has sections): choose a section.
-async function choosePickCollection(col) {
+// Step 2 (only when the collection has sections): choose a section. `summary`
+// is a lightweight summary; the full record is loaded only if it has sections.
+async function choosePickCollection(summary) {
+  if (!summary.sectionCount) {
+    await confirmPick(summary.id, null);
+    return;
+  }
+  const col = await Store.getCollection(summary.id);
+  if (!col) {
+    await confirmPick(summary.id, null);
+    return;
+  }
   const sections = col.sections || [];
   if (sections.length === 0) {
     await confirmPick(col.id, null);
@@ -819,6 +939,10 @@ async function confirmPick(collectionId, sectionId = null) {
   const item = state.pendingItem;
   if (!item) return;
   const res = await Store.addItem(collectionId, { ...item, sectionId });
+  if (res && res.limit) {
+    toast(limitMessage(res.limit));
+    return; // keep the pending item and modal open so the user can pick elsewhere
+  }
   await clearPending();
   $("#pick-modal").classList.add("hidden");
   state.pendingItem = null;
@@ -920,6 +1044,60 @@ function toast(msg) {
   el.classList.remove("hidden");
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => el.classList.add("hidden"), 2200);
+}
+
+// Copy for a blocked write. "collection" = this collection hit the per-item sync
+// ceiling; "total" = synced storage as a whole is full.
+function limitMessage(scope) {
+  return scope === "total"
+    ? "Sync storage is full — delete some items to save more."
+    : "This collection is full — it's reached the sync size limit.";
+}
+
+// True when a mutation result signals a hard-stop; toasts the reason.
+function handledLimit(res) {
+  if (res && res.limit) {
+    toast(limitMessage(res.limit));
+    return true;
+  }
+  return false;
+}
+
+// Populate and open the About modal with live synced-storage usage.
+async function openAbout() {
+  $("#about-modal").classList.remove("hidden");
+  const fill = $("#about-usage-fill");
+  const text = $("#about-usage-text");
+  try {
+    const u = await Store.getUsage();
+    const usedKb = (u.usedBytes / 1024).toFixed(1);
+    const totalKb = Math.round(u.totalBytes / 1024);
+    const pct = Math.min(100, Math.round((u.usedBytes / u.totalBytes) * 100));
+    fill.style.width = pct + "%";
+    fill.classList.toggle("near-full", pct >= 85);
+    let msg = `Using ${usedKb} KB of ~${totalKb} KB (${pct}%) across ${u.syncedCollections} synced collection${
+      u.syncedCollections === 1 ? "" : "s"
+    }.`;
+    if (u.oversizedCollections > 0) {
+      msg += ` ${u.oversizedCollections} collection${
+        u.oversizedCollections === 1 ? " is" : "s are"
+      } too large to sync (kept on this device only).`;
+    }
+    text.textContent = msg;
+  } catch (e) {
+    warn("usage read failed:", e);
+    text.textContent = "Couldn't read current usage.";
+  }
+}
+
+// One-shot messages stashed by contexts without their own UI (e.g. the context
+// menu). Read once and cleared.
+async function checkFlash() {
+  const { flash } = await chrome.storage.local.get("flash");
+  if (flash && flash.message) {
+    await chrome.storage.local.remove("flash");
+    toast(flash.message);
+  }
 }
 
 // --- Settings, theme & pin -------------------------------------------------
@@ -1026,6 +1204,7 @@ async function addSectionFromInput() {
 function bindEvents() {
   $("#new-collection-btn").addEventListener("click", async () => {
     const col = await Store.createCollection("");
+    if (handledLimit(col)) return;
     showDetail(col.id);
     // Focus the name field so the user can rename immediately.
     const input = $("#collection-name-input");
@@ -1046,6 +1225,15 @@ function bindEvents() {
   });
   $("#settings-modal").addEventListener("click", (e) => {
     if (e.target.id === "settings-modal") $("#settings-modal").classList.add("hidden");
+  });
+
+  // About & sync-limits modal.
+  $("#about-btn").addEventListener("click", openAbout);
+  $("#about-close").addEventListener("click", () => {
+    $("#about-modal").classList.add("hidden");
+  });
+  $("#about-modal").addEventListener("click", (e) => {
+    if (e.target.id === "about-modal") $("#about-modal").classList.add("hidden");
   });
   for (const radio of document.querySelectorAll('input[name="theme"]')) {
     radio.addEventListener("change", (e) => {
@@ -1115,8 +1303,9 @@ function bindEvents() {
   // Section boxes can be dragged to reorder within their container.
   attachSectionContainer($("#sections-container"));
 
-  // Cross-collection search.
-  $("#search-input").addEventListener("input", (e) => runSearch(e.target.value));
+  // Cross-collection search. Debounced so typing doesn't re-query storage and
+  // rebuild the results list on every keystroke.
+  $("#search-input").addEventListener("input", (e) => debouncedSearch(e.target.value));
 
   // Keyboard-shortcut pick modal.
   $("#pick-cancel").addEventListener("click", async () => {
@@ -1126,6 +1315,7 @@ function bindEvents() {
   });
   $("#pick-new").addEventListener("click", async () => {
     const col = await Store.createCollection("");
+    if (handledLimit(col)) return;
     await confirmPick(col.id);
   });
 
@@ -1210,6 +1400,10 @@ function bindEvents() {
     if (changes["focus_collection"] && changes["focus_collection"].newValue) {
       checkFocusCollection();
     }
+    // A UI-less context (context menu) may leave a one-shot message to surface.
+    if (changes["flash"] && changes["flash"].newValue) {
+      checkFlash();
+    }
 
     if (!changes[Store.STORAGE_KEY]) return;
     if (isEditing()) return;
@@ -1227,12 +1421,18 @@ async function init() {
   perf("module eval → init start");
   bindEvents();
   perf("bindEvents done");
-  await initSettings();
-  perf("initSettings done (theme/pin applied)");
-  await showList();
-  perf("showList/renderList done (collections painted)");
+  // Settings (theme/pin) and the collection list read from independent stores
+  // and don't depend on each other — run both concurrently so the list isn't
+  // gated behind the settings round-trip. The "system" theme is already applied
+  // statically via <html data-theme="system">, so there's no flash while the
+  // stored theme resolves.
+  const settingsDone = initSettings();
+  const listDone = showList();
+  await Promise.all([listDone, settingsDone]);
+  perf("showList + initSettings done (collections painted)");
   await checkPendingAdd();
   await checkFocusCollection();
+  await checkFlash();
   perf("init complete");
 }
 

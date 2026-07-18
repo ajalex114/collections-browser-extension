@@ -233,6 +233,12 @@ button {
   box-shadow: var(--shadow);
   margin-bottom: 12px;
   cursor: pointer;
+  /* Virtualized rendering: skip layout/paint for off-screen cards so long
+     lists stay fast. Nodes remain in the DOM, so drag-reorder and querying are
+     unaffected. `auto` lets the browser remember each card's real height; the
+     length is only the pre-first-render placeholder for scrollbar sizing. */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 74px;
 }
 
 .collection-card:hover {
@@ -302,6 +308,12 @@ button {
   background: var(--surface);
   box-shadow: var(--shadow);
   margin-bottom: 12px;
+  /* Virtualized rendering: skip layout/paint for off-screen item cards. All
+     nodes stay in the DOM so drag-and-drop and persistItemLayout (which
+     enumerate the full list) keep working. `auto` remembers each card's real
+     height after first render; the length is only the placeholder estimate. */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 68px;
 }
 
 .item-card .item-body {
@@ -856,5 +868,103 @@ button.danger {
     animation: none !important;
     scroll-behavior: auto !important;
   }
+}
+
+/* Sync-limit banner (detail view) */
+.limit-banner {
+  margin: 0 12px 8px;
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 12%, var(--surface));
+  border: 1px solid color-mix(in srgb, var(--danger) 35%, transparent);
+}
+
+/* About footer (list view) */
+.list-footer {
+  margin-top: auto;
+  padding: 10px 12px 14px;
+  text-align: center;
+  border-top: 1px solid var(--border);
+}
+
+.link-btn {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  padding: 4px 6px;
+  border-radius: 6px;
+}
+
+.link-btn:hover {
+  color: var(--accent);
+  text-decoration: underline;
+}
+
+/* About modal */
+.about-usage {
+  margin-bottom: 14px;
+}
+
+.about-usage-bar {
+  height: 8px;
+  border-radius: 999px;
+  background: var(--surface-hover);
+  border: 1px solid var(--border);
+  overflow: hidden;
+}
+
+.about-usage-bar span {
+  display: block;
+  height: 100%;
+  width: 0;
+  background: var(--accent);
+  transition: width 0.2s ease;
+}
+
+.about-usage-bar span.near-full {
+  background: var(--danger);
+}
+
+.about-usage-text {
+  margin: 8px 0 0;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.about-body {
+  overflow-y: auto;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.about-body p {
+  margin: 0 0 10px;
+}
+
+.about-body ul {
+  margin: 0 0 10px;
+  padding-left: 18px;
+}
+
+.about-body li {
+  margin-bottom: 4px;
+}
+
+.about-body .hint {
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+.about-credit {
+  margin: 12px 0;
+  text-align: center;
+  font-size: 12px;
+  color: var(--text-dim);
 }
 

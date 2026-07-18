@@ -115,6 +115,8 @@ or its behavior changes.
 - The search bar in the list view matches item titles, URLs, notes, and also
   **collection** and **section** names. Matching a collection or section name
   lists all items within it. Each result shows `in collection - section`.
+  Typing is debounced (~75 ms) so results refresh once you pause, not on every
+  keystroke.
 
 ### Duplicate links
 - Adding a page/link whose URL already exists in the target collection is
@@ -208,6 +210,40 @@ count badge, followed by the items beneath it — matching a clean, grouped list
   the overlay window itself (spotlight / quick-save).
   within the collection; the new order is saved on drop.
 
+## Performance
+- **Overlays paint before data.** The spotlight and quick-save overlays inject
+  their shell (search box / panes) immediately using only the theme, then
+  hydrate with collections a moment later. The list fills in as soon as the data
+  is ready, so the UI is never blocked waiting on storage.
+- **Sync pull is deferred on boot.** When the service worker wakes, the initial
+  cross-device reconciliation is delayed briefly so the user's action is served
+  first; live remote changes are still applied immediately via the storage
+  listener.
+- **The side panel paints its list and settings in parallel.** On open, the
+  panel reads collections and settings concurrently instead of waiting for the
+  settings round-trip before rendering the list. The `sync` engine is not part
+  of the panel's boot bundle — it loads lazily (only the service worker needs it
+  eagerly; the panel touches it only when you change a setting).
+- **List and menus read a summary index, not full collections.** Every write
+  maintains a lightweight per-collection summary (name, order, item/section
+  counts, and up to four preview thumbnails) in a separate store. The collection
+  list, the context menus, and the "add current tab to…" picker read only these
+  summaries, so they stay fast no matter how many items a collection holds. The
+  detail view, "open all"/"copy all", and cross-collection search still load the
+  full record(s) they need. The summary store is rebuilt automatically the first
+  time the service worker runs after upgrading.
+- **Long lists are virtualized via CSS containment.** Collection cards and item
+  cards use `content-visibility: auto`, so the browser skips layout and painting
+  for rows that are off-screen. Every card stays in the DOM (nothing is removed),
+  so drag-and-drop, reordering, inline editing, and search behave exactly as
+  before — only the rendering cost of large lists is reduced.
+- **Opening a collection mounts items incrementally.** The detail view renders
+  the first screenful of item cards immediately, then appends the rest in
+  animation-frame batches, so opening a very large collection stays responsive.
+  The final list is identical; any action that reads the whole list (starting a
+  drag, saving a reorder) first finishes mounting synchronously, so nothing is
+  ever missed.
+
 ## Search
 
 ### Search across collections
@@ -254,3 +290,36 @@ count badge, followed by the items beneath it — matching a clean, grouped list
 - Conflicts resolve last-write-wins; deletes propagate via tombstones.
 - No network requests, telemetry, or third-party code — the browser performs all
   syncing; the extension only reads/writes storage APIs.
+
+## Sync limits & About
+
+The browser's sync storage is small and hard-capped (~8 KB per collection,
+~100 KB total). To keep everything you save able to sync — instead of silently
+falling back to local-only — the extension enforces those byte budgets before
+writing, using the same text-only projection the sync layer pushes.
+
+### Hard stop when full
+- **A collection at its size limit blocks new items.** When adding an item would
+  push a collection past the ~8 KB per-collection sync budget, the add is
+  refused and nothing is written. This applies to every add path: the ⋯ menu,
+  "Add current tab", "Add open tabs", drag-in, the keyboard-shortcut picker, the
+  quick-save overlays, and the right-click context menu.
+- **A full store blocks new collections.** When synced storage as a whole would
+  exceed its ~100 KB budget, creating another collection is refused.
+- Blocked actions surface a message where they happen: a toast in the side panel,
+  a status line in the save overlays, and a one-shot notice (via a `flash`
+  message the panel picks up) for the context menu.
+- The open collection shows a persistent **"This collection is full"** banner
+  once it is at (or within ~600 bytes of) the per-collection limit.
+- **Import is not limited.** Restoring from a JSON export can bring in a
+  collection larger than the sync budget; such collections are kept local-only
+  (flagged `oversized`) exactly as before, so a restore never loses data.
+
+### About & sync limits panel
+- A footer link **"About & sync limits"** at the bottom of the list view opens a
+  dialog explaining what syncs (text only; images stay local), the per-collection
+  and total caps, and rough capacity (~25–30 links per collection, ~350 total).
+- The panel shows **live usage** — how much of the ~100 KB sync budget is in use,
+  across how many collections, and how many are too large to sync — read from the
+  precomputed `syncBytes`/`oversized` fields on each collection summary (no item
+  payloads are loaded).

@@ -109,6 +109,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     let sectionId = msg.sectionId || null;
     if (msg.newCollection != null) {
       const col = await CollectionStore.createCollection(msg.newCollection);
+      if (col && col.limit) {
+        sendResponse({ limit: col.limit });
+        return;
+      }
       collectionId = col.id;
       sectionId = null;
       log("quick-save: created collection", col.id, col.name);
@@ -131,7 +135,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     };
     log("quick-save:", tab.url, "->", collectionId, "section", sectionId || "(none)");
     const res = await CollectionStore.addItem(collectionId, item, true);
-    if (res && res.duplicate) sendResponse({ duplicate: true });
+    if (res && res.limit) sendResponse({ limit: res.limit });
+    else if (res && res.duplicate) sendResponse({ duplicate: true });
     else sendResponse({ added: true, collectionId });
   })().catch((err) => {
     warn("quick-save failed:", err?.message);
@@ -146,6 +151,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg?.type === "create-collection") {
     CollectionStore.createCollection(msg.name)
       .then((col) => {
+        if (col && col.limit) {
+          sendResponse({ limit: col.limit });
+          return;
+        }
         log("create-collection:", col.id, col.name);
         sendResponse({ collection: { id: col.id, name: col.name } });
       })
@@ -174,20 +183,28 @@ chrome.runtime.onMessage.addListener((msg, sender) => {
   if (winId != null) chrome.sidePanel.open({ windowId: winId }).catch(() => {});
 });
 
-// Keep the "Add to Collection" submenu in sync with stored collections.
+// Keep the "Add to Collection" submenu in sync with stored collections. Item
+// edits fire this too (via the shared beacon), so the actual rebuild is
+// debounced and skipped when the collection set/names/order are unchanged.
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area === "local" && changes[CollectionStore.STORAGE_KEY]) {
     rebuildMenus();
   }
 });
 
-async function rebuildMenus() {
-  // Coalesce concurrent triggers (onInstalled + the migration's storage beacon
-  // can fire together). Two interleaved removeAll()/create() passes would leave
-  // a child pointing at a parent the other pass just wiped ("Cannot find menu
-  // item with id collection-add-parent").
-  menuChain = menuChain.then(doRebuildMenus, doRebuildMenus);
-  return menuChain;
+let menuTimer = null;
+let lastMenuSig = null;
+const MENU_DEBOUNCE_MS = 400;
+
+// Debounced scheduler: coalesces bursts of mutations and keeps the (data-
+// scanning) rebuild off the immediate cold-boot critical path so a shortcut
+// pressed at startup is served first.
+function rebuildMenus() {
+  if (menuTimer) return;
+  menuTimer = setTimeout(() => {
+    menuTimer = null;
+    menuChain = menuChain.then(doRebuildMenus, doRebuildMenus);
+  }, MENU_DEBOUNCE_MS);
 }
 
 async function doRebuildMenus() {
@@ -195,7 +212,19 @@ async function doRebuildMenus() {
   // Fetch BEFORE removeAll() so the parent and every child are created in one
   // synchronous burst — no await between them — guaranteeing the parent exists
   // before any child references it.
-  const collections = await CollectionStore.getCollections();
+  const collections = await CollectionStore.getSummaries();
+
+  // The menu only reflects collection ids/names/order — not their items. Skip
+  // the contextMenus churn when nothing menu-relevant changed (e.g. an item was
+  // added or edited). lastMenuSig is null after a cold SW start (menus don't
+  // persist across restarts), so the first rebuild always runs.
+  const sig = collections.map((c) => c.id + "\u0000" + (c.name || "")).join("\u0001");
+  if (sig === lastMenuSig) {
+    log("rebuildMenus skipped (unchanged) in", Date.now() - t0, "ms");
+    return;
+  }
+  lastMenuSig = sig;
+
   await chrome.contextMenus.removeAll();
   const contexts = ["page", "link", "image", "selection"];
   chrome.contextMenus.create({
@@ -235,6 +264,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
 
   if (info.menuItemId === NEW_COLLECTION_ID) {
     const col = await CollectionStore.createCollection("");
+    if (col && col.limit) return flashLimit(col.limit, tab);
     collectionId = col.id;
   } else if (typeof info.menuItemId === "string" && info.menuItemId.startsWith("col:")) {
     collectionId = info.menuItemId.slice(4);
@@ -243,13 +273,27 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   }
 
   const item = buildItemFromContext(info, tab);
-  await CollectionStore.addItem(collectionId, item);
+  const res = await CollectionStore.addItem(collectionId, item);
+  if (res && res.limit) return flashLimit(res.limit, tab);
 
   // Surface the panel so the user sees the result.
   if (tab && tab.windowId != null) {
     chrome.sidePanel.open({ windowId: tab.windowId }).catch(() => {});
   }
 });
+
+// The context menu has no UI of its own to warn in, so stash a one-shot message
+// the side panel picks up (see sidepanel.js checkFlash) and open the panel.
+function flashLimit(scope, tab) {
+  const message =
+    scope === "total"
+      ? "Sync storage is full — delete some items to save more."
+      : "That collection is full — it's reached the sync size limit.";
+  chrome.storage.local.set({ flash: { message, at: Date.now() } });
+  if (tab && tab.windowId != null) {
+    chrome.sidePanel.open({ windowId: tab.windowId }).catch(() => {});
+  }
+}
 
 // Keyboard shortcuts open a centered overlay WINDOW (an extension page) rather
 // than injecting an overlay into the current page. This works everywhere —
@@ -329,20 +373,40 @@ async function openOverlay(mode) {
 
   if (tab && tab.id != null && isInjectablePage(tab.url)) {
     try {
-      const { collections, settings } = await CollectionStore.getSnapshot();
-      const theme = (settings && settings.theme) || "system";
+      // Paint the overlay shell immediately using only the theme (a cheap
+      // storage.local read) — do NOT wait on the collections snapshot, which on
+      // a cold-booted worker also pays IndexedDB open + getAll.
+      const { theme } = await CollectionStore.getSettings();
       await chrome.scripting.executeScript({
         target: { tabId: tab.id },
         func,
-        args: [collections, theme],
+        args: [null, theme || "system"],
       });
-      log(mode, "in-page overlay injected in", Date.now() - t0, "ms");
+      log(mode, "overlay shell injected in", Date.now() - t0, "ms");
+
+      // Hydrate with data as soon as it's ready; this never blocks the paint.
+      const { collections } = await CollectionStore.getSnapshot();
+      await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        func: hydrateOverlay,
+        args: [mode, collections],
+      });
+      log(mode, "overlay hydrated in", Date.now() - t0, "ms");
       return;
     } catch (err) {
       warn(mode, "injection failed, falling back to window:", err?.message);
     }
   }
   await openOverlayWindow(mode);
+}
+
+// Second-phase injection: hand the collections snapshot to the already-painted
+// overlay via the hydrate hook it exposed on its host element. Self-contained.
+function hydrateOverlay(mode, collections) {
+  const hostId =
+    mode === "spotlight" ? "__collection_spotlight_host__" : "__collection_quicksave_host__";
+  const host = document.getElementById(hostId);
+  if (host && typeof host.__collHydrate === "function") host.__collHydrate(collections);
 }
 
 chrome.commands.onCommand.addListener((command) => {
@@ -387,34 +451,41 @@ function spotlightOverlay(collections, theme) {
         glow: "0 0 0 1px oklch(0.62 0.13 172 / 0.25), 0 30px 80px -20px oklch(0.2 0.03 240 / 0.4)",
       };
 
-  // Flatten collections into searchable entries with a "collection - section" label.
-  const entries = [];
-  for (const col of collections) {
-    const sectionTitle = {};
-    for (const s of col.sections || []) sectionTitle[s.id] = s.title;
-    const items = col.items || [];
-    if (items.length === 0) {
-      entries.push({ title: col.name, label: col.name, url: "", collectionId: col.id });
-      continue;
+  // Flatten collections into searchable entries with a "collection - section"
+  // label. Filled by hydrate(), which runs inline when the snapshot is passed
+  // directly, or via the deferred second-phase injection (skeleton-first paint).
+  let entries = [];
+  function hydrate(cols) {
+    entries = [];
+    for (const col of cols || []) {
+      const sectionTitle = {};
+      for (const s of col.sections || []) sectionTitle[s.id] = s.title;
+      const items = col.items || [];
+      if (items.length === 0) {
+        entries.push({ title: col.name, label: col.name, url: "", collectionId: col.id });
+        continue;
+      }
+      for (const item of items) {
+        let title;
+        if (item.type === "note") title = item.note || "(empty note)";
+        else title = item.title || item.url || "(untitled)";
+        const sec = item.sectionId ? sectionTitle[item.sectionId] : "";
+        const label = sec ? col.name + " - " + sec : col.name;
+        entries.push({
+          title,
+          label,
+          // Matching also considers collection + section names so searching a
+          // collection or section name lists all items within it.
+          hay: (title + " " + label + " " + (item.url || item.imageUrl || "")).toLowerCase(),
+          url: item.type === "note" ? "" : item.url || item.imageUrl || "",
+          collectionId: col.id,
+        });
+      }
     }
-    for (const item of items) {
-      let title;
-      if (item.type === "note") title = item.note || "(empty note)";
-      else title = item.title || item.url || "(untitled)";
-      const sec = item.sectionId ? sectionTitle[item.sectionId] : "";
-      const label = sec ? col.name + " - " + sec : col.name;
-      entries.push({
-        title,
-        label,
-        // Matching also considers collection + section names so searching a
-        // collection or section name lists all items within it.
-        hay: (title + " " + label + " " + (item.url || item.imageUrl || "")).toLowerCase(),
-        url: item.type === "note" ? "" : item.url || item.imageUrl || "",
-        collectionId: col.id,
-      });
-    }
+    for (const e of entries) if (!e.hay) e.hay = (e.title + " " + e.label).toLowerCase();
+    // Reflect any text the user already typed before the data arrived.
+    if (input) render(input.value);
   }
-  for (const e of entries) if (!e.hay) e.hay = (e.title + " " + e.label).toLowerCase();
 
   const host = document.createElement("div");
   host.id = HOST_ID;
@@ -562,6 +633,10 @@ function spotlightOverlay(collections, theme) {
   host.addEventListener("click", (e) => {
     if (e.target === host) close();
   });
+  // Expose the hydrate hook so the deferred second-phase injection can feed in
+  // collections; hydrate inline when they were passed directly.
+  host.__collHydrate = hydrate;
+  if (Array.isArray(collections)) hydrate(collections);
   input.focus();
 }
 
@@ -674,7 +749,16 @@ function quickSaveOverlay(collections, theme) {
   const searchInput = shadow.getElementById("qs-search");
   titleInput.value = document.title || location.href || "";
   let query = "";
-  let visibleCols = collections.slice();
+  let baseCollections = [];
+  let visibleCols = [];
+  // Feed collections in (inline, or via the deferred second-phase injection)
+  // and repaint the collection/section panes.
+  function hydrate(cols) {
+    baseCollections = (cols || []).slice();
+    renderCollections();
+    renderSections();
+    paintSel();
+  }
 
   function close() {
     host.remove();
@@ -687,6 +771,13 @@ function quickSaveOverlay(collections, theme) {
     chrome.runtime.sendMessage(
       Object.assign({ type: "quick-save", title: title || undefined }, payload),
       (resp) => {
+        if (resp && resp.limit) {
+          statusEl.textContent =
+            resp.limit === "total"
+              ? "Sync storage is full — can't save more"
+              : "This collection is full — pick another";
+          return;
+        }
         if (resp && resp.duplicate) {
           statusEl.textContent = "Already in this collection — pick another";
           return;
@@ -762,11 +853,15 @@ function quickSaveOverlay(collections, theme) {
   function createCollection(name) {
     statusEl.textContent = "Creating…";
     chrome.runtime.sendMessage({ type: "create-collection", name }, (resp) => {
+      if (resp && resp.limit) {
+        statusEl.textContent = "Sync storage is full — can't add collections";
+        return;
+      }
       if (!resp || resp.error || !resp.collection) {
         statusEl.textContent = "Couldn't create collection";
         return;
       }
-      collections.push({ id: resp.collection.id, name: resp.collection.name, sections: [], items: [] });
+      baseCollections.push({ id: resp.collection.id, name: resp.collection.name, sections: [], items: [] });
       query = "";
       searchInput.value = "";
       zone = "col";
@@ -868,7 +963,7 @@ function quickSaveOverlay(collections, theme) {
 
   function renderCollections() {
     colWrap.innerHTML = "";
-    visibleCols = collections.filter(collectionMatches);
+    visibleCols = baseCollections.filter(collectionMatches);
     if (colIdx >= visibleCols.length) colIdx = Math.max(0, visibleCols.length - 1);
 
     if (query && !visibleCols.length) {
@@ -1089,6 +1184,10 @@ function quickSaveOverlay(collections, theme) {
     if (e.target === backdrop) close();
   });
   host.tabIndex = -1;
+  // Expose the hydrate hook for the deferred second-phase injection; hydrate
+  // inline when collections were passed directly.
+  host.__collHydrate = hydrate;
+  if (Array.isArray(collections)) hydrate(collections);
   searchInput.focus();
 }
 

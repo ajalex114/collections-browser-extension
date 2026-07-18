@@ -135,8 +135,14 @@ test("projection strips media; rehydrate preserves local images", async () => {
 test("oversized collections stay local and are flagged in the index", async () => {
   const { area, A } = pair();
   A.clock.set(100);
-  const c = await A.repo.createCollection("Big");
-  await A.repo.addItem(c.id, { type: "note", note: "x".repeat(9000) });
+  // The per-item add path now hard-stops before a collection gets too big to
+  // sync, so an oversized collection can only arrive via bulk import (restore)
+  // or a legacy record. Import one and confirm sync keeps it local-only.
+  await A.repo.importCollections(
+    [{ id: "big1", name: "Big", sections: [], items: [{ id: "i1", type: "note", note: "x".repeat(9000) }] }],
+    "merge"
+  );
+  const [c] = await A.repo.listCollections();
   await A.sync.flush();
 
   assert.equal(area._data[KEY_PREFIX + c.id], undefined, "payload not synced");

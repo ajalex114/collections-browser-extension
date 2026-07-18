@@ -111,6 +111,17 @@ export class IndexedDbAdapter {
     });
   }
 
+  // Write records across one or more stores in a single atomic transaction.
+  // `writes` is an array of { store, value }. Used to keep a derived record
+  // (e.g. a collection summary) consistent with its source in one commit.
+  async putMany(writes) {
+    if (!writes.length) return;
+    const stores = [...new Set(writes.map((w) => w.store))];
+    return this._tx(stores, "readwrite", (tx) => {
+      for (const w of writes) tx.objectStore(w.store).put(w.value);
+    });
+  }
+
   // Replace the full contents of a store atomically (clear + write).
   async replaceAll(store, values) {
     return this._tx(store, "readwrite", (tx) => {

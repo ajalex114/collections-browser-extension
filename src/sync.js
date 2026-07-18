@@ -14,12 +14,15 @@
 // through onChanged but lose the LWW comparison (equal timestamps), so they are
 // ignored without special-casing.
 
-const KEY_PREFIX = "c:";
+import { KEY_PREFIX, project, withinItemBudget } from "./limits.js";
+
 const KEY_INDEX = "c_index";
 const KEY_SETTINGS = "settings";
 const FLUSH_DELAY_MS = 2000;
-// Leave headroom under chrome.storage.sync QUOTA_BYTES_PER_ITEM (8192).
-const ITEM_BUDGET_BYTES = 8000;
+// Delay the initial full reconciliation so a just-woken service worker can
+// answer the user's action (open panel / overlay) before scanning all of
+// synced storage. The live onChanged listener still catches remote changes.
+const INITIAL_PULL_DELAY_MS = 1500;
 
 export class SyncMirror {
   /**
@@ -55,8 +58,13 @@ export class SyncMirror {
     chrome.storage.onChanged.addListener((changes, area) => {
       if (area === "sync") this._onRemoteChange(changes).catch((e) => this._log("pull failed", e));
     });
-    // Reconcile anything that changed while this context was asleep.
-    this._pullAll().catch((e) => this._log("initial pull failed", e));
+    // Reconcile anything that changed while this context was asleep — but off
+    // the cold-boot critical path so the user's action is served first. The
+    // onChanged listener above already handles live remote changes meanwhile.
+    setTimeout(
+      () => this._pullAll().catch((e) => this._log("initial pull failed", e)),
+      INITIAL_PULL_DELAY_MS
+    );
   }
 
   // Debounced push of all dirty local collections + settings.
@@ -91,7 +99,7 @@ export class SyncMirror {
           continue;
         }
         const payload = project(rec);
-        if (withinBudget(key, payload)) {
+        if (withinItemBudget(rec)) {
           batch[key] = payload;
         } else {
           // Too big for synced storage even after stripping media: keep it
@@ -231,32 +239,8 @@ function summarize(rec) {
   };
 }
 
-// Text-only projection sent to synced storage. Drops media (thumbnail, imageUrl)
-// and any favicon that is an inlined data: URL — those stay in IndexedDB.
-function project(rec) {
-  return {
-    id: rec.id,
-    name: rec.name,
-    createdAt: rec.createdAt,
-    order: rec.order,
-    updatedAt: rec.updatedAt,
-    rev: rec.rev,
-    deviceId: rec.deviceId,
-    deletedAt: rec.deletedAt || null,
-    sections: (rec.sections || []).map((s) => ({ id: s.id, title: s.title, createdAt: s.createdAt })),
-    items: (rec.items || []).map((i) => ({
-      id: i.id,
-      type: i.type,
-      title: i.title,
-      url: i.url,
-      note: i.note,
-      color: i.color,
-      sectionId: i.sectionId || null,
-      addedAt: i.addedAt,
-      favIconUrl: isLinkUrl(i.favIconUrl) ? i.favIconUrl : "",
-    })),
-  };
-}
+// Text-only projection lives in limits.js (shared with the repository's
+// hard-stop). rehydrate() below is sync-only, so it stays here.
 
 // Rebuild a full local record from a synced projection, preserving any local
 // media (images/thumbnails/data-URL favicons) matched by item id.
@@ -300,13 +284,4 @@ function wins(remote, local, localDeviceId) {
   const rd = remote.deviceId || "";
   const ld = local.deviceId || localDeviceId || "";
   return rd > ld;
-}
-
-function isLinkUrl(url) {
-  return typeof url === "string" && /^https?:\/\//i.test(url);
-}
-
-function withinBudget(key, value) {
-  // Approximate the serialized item size (key + JSON value) against the quota.
-  return key.length + JSON.stringify(value).length + 8 <= ITEM_BUDGET_BYTES;
 }

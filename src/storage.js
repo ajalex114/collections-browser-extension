@@ -20,17 +20,17 @@ import {
   CollectionRepository,
   STORE_COLLECTIONS,
   STORE_META,
+  STORE_SUMMARIES,
   INDEX_UPDATED_AT,
   normalize,
 } from "./repository.js";
-import { SyncMirror } from "./sync.js";
 
 const STORAGE_KEY = "collections_data"; // now a revision beacon, not the data
 const SETTINGS_KEY = "app_settings";
 const SCHEMA_VERSION = 1; // export-file schema (kept stable for interop)
 
 const DB_NAME = "collections_db";
-const DB_VERSION = 1;
+const DB_VERSION = 2; // v2 adds the `summaries` store (lightweight list/menu index)
 
 const DEFAULT_SETTINGS = { theme: "system", pinned: false };
 
@@ -61,6 +61,11 @@ const db = new IndexedDbAdapter(DB_NAME, DB_VERSION, (database) => {
   if (!database.objectStoreNames.contains(STORE_META)) {
     database.createObjectStore(STORE_META, { keyPath: "key" });
   }
+  // v2: derived summaries store. Backfilled from collections by
+  // repository.ensureSummaries() on first service-worker init after upgrade.
+  if (!database.objectStoreNames.contains(STORE_SUMMARIES)) {
+    database.createObjectStore(STORE_SUMMARIES, { keyPath: "id" });
+  }
 });
 
 // deviceId is filled during init(); mutations await ready first, so every
@@ -84,13 +89,31 @@ const settingsBridge = {
   applyRemote: (remote) => writeSettingsLocal(remote),
 };
 
-const sync = new SyncMirror({
-  repository,
-  deviceId: clock.deviceId, // replaced with the resolved id in init()
-  notifier,
-  settingsBridge,
-  log,
-});
+// SyncMirror is loaded lazily via dynamic import so it stays out of the side
+// panel / popup boot bundle — those surfaces only touch sync when the user
+// saves settings, which is rare and off the hot path. The service worker loads
+// it during init() (it is the single writer and drives cross-device sync).
+// Dynamic import in a module service worker is supported from Chrome 91+; the
+// manifest requires 114.
+let syncInstance = null;
+let syncPromise = null;
+function getSync() {
+  if (syncInstance) return Promise.resolve(syncInstance);
+  if (!syncPromise) {
+    syncPromise = import("./sync.js").then(({ SyncMirror }) => {
+      syncInstance = new SyncMirror({
+        repository,
+        deviceId: clock.deviceId,
+        notifier,
+        settingsBridge,
+        log,
+      });
+      syncInstance._deviceId = clock.deviceId;
+      return syncInstance;
+    });
+  }
+  return syncPromise;
+}
 
 // --- Init: device id, migration, sync start --------------------------------
 
@@ -132,9 +155,11 @@ async function migrateLegacyBlob() {
 
 async function init() {
   clock.deviceId = await ensureDeviceId();
-  sync._deviceId = clock.deviceId;
   if (IS_SERVICE_WORKER) {
     await migrateLegacyBlob();
+    await repository.ensureSummaries();
+    const sync = await getSync();
+    sync._deviceId = clock.deviceId;
     sync.start();
   }
 }
@@ -165,7 +190,7 @@ async function saveSettings(patch) {
     deviceId: clock.deviceId,
   };
   await writeSettingsLocal(next);
-  sync.pushSettings(next).catch(() => {});
+  getSync().then((s) => s.pushSettings(next)).catch(() => {});
   return next;
 }
 
@@ -174,6 +199,25 @@ async function saveSettings(patch) {
 async function getCollections() {
   await ready;
   return repository.listCollections();
+}
+
+// Lightweight per-collection summaries (no item payloads) for list/menu views.
+async function getSummaries() {
+  await ready;
+  return repository.listSummaries();
+}
+
+// A single full collection by id (item payloads included). Used by detail/open
+// views so they never load every other collection's items.
+async function getCollection(id) {
+  await ready;
+  return repository.getCollection(id);
+}
+
+// Current synced-storage usage + limits, for the About panel.
+async function getUsage() {
+  await ready;
+  return repository.syncUsage();
 }
 
 // One call that returns both collections and settings for the hot path
@@ -300,7 +344,8 @@ function serialize(task) {
 
 function afterMutation() {
   notifier.bump("local");
-  if (IS_SERVICE_WORKER) sync.scheduleFlush();
+  // SW only, and sync is already loaded by init() there — resolves immediately.
+  if (IS_SERVICE_WORKER) getSync().then((s) => s.scheduleFlush());
 }
 
 const MUTATION_METHODS = [
@@ -359,6 +404,9 @@ export const CollectionStore = {
   saveSettings,
   uid,
   getCollections,
+  getSummaries,
+  getCollection,
+  getUsage,
   getSnapshot,
   exportData,
   MUTATION_METHODS,

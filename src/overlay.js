@@ -257,6 +257,13 @@ function renderQuickSave() {
         payload
       ),
       (resp) => {
+        if (resp && resp.limit) {
+          statusEl.textContent =
+            resp.limit === "total"
+              ? "Sync storage is full — can't save more"
+              : "This collection is full — pick another";
+          return;
+        }
         if (resp && resp.duplicate) {
           statusEl.textContent = "Already in this collection — pick another";
           return;
@@ -320,6 +327,10 @@ function renderQuickSave() {
   function createCollection(name) {
     statusEl.textContent = "Creating…";
     chrome.runtime.sendMessage({ type: "create-collection", name }, (resp) => {
+      if (resp && resp.limit) {
+        statusEl.textContent = "Sync storage is full — can't add collections";
+        return;
+      }
       if (!resp || resp.error || !resp.collection) {
         statusEl.textContent = "Couldn't create collection";
         return;

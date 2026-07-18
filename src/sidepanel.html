@@ -39,6 +39,9 @@
         <p>No collections yet.</p>
         <p class="hint">Create one, then right-click any page, link, or image to add it.</p>
       </div>
+      <footer class="list-footer">
+        <button id="about-btn" class="link-btn" aria-haspopup="dialog">About</button>
+      </footer>
     </div>
 
     <!-- DETAIL VIEW: a single collection -->
@@ -53,6 +56,10 @@
 
       <div class="detail-toolbar">
         <button id="add-current-tab-btn" class="primary-btn add-current-tab-btn">＋ Add current tab</button>
+      </div>
+
+      <div id="detail-limit-banner" class="limit-banner hidden" role="status">
+        This collection is full — it's reached the sync size limit. Remove items to add more, or start a new collection.
       </div>
 
       <div id="detail-menu" class="menu hidden" role="menu" aria-label="Collection actions">
@@ -149,6 +156,43 @@
 
     <input id="import-file" type="file" accept="application/json,.json" hidden />
     <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+
+    <!-- About modal -->
+    <div id="about-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="about-modal-title">
+      <div class="modal-card">
+        <h2 id="about-modal-title">About</h2>
+
+        <div class="about-usage">
+          <div class="about-usage-bar"><span id="about-usage-fill"></span></div>
+          <p id="about-usage-text" class="about-usage-text">Calculating usage…</p>
+        </div>
+
+        <div class="about-body">
+          <p>
+            Collections sync across your signed-in browsers using the browser's
+            built-in sync storage. Only <strong>text</strong> — links, titles,
+            notes and favicons — is synced. Images and thumbnails always stay on
+            this device.
+          </p>
+          <p>That storage is small and capped by the browser, so there are hard limits:</p>
+          <ul>
+            <li><strong>~8&nbsp;KB per collection</strong> — about <strong>25–30 links</strong>, depending on URL and title length.</li>
+            <li><strong>~100&nbsp;KB in total</strong> — roughly <strong>350 links</strong> across all collections.</li>
+          </ul>
+          <p>
+            When a collection or your overall storage reaches its limit, saving
+            new items is blocked so nothing silently fails to sync. Collections
+            too big to sync are kept on this device only.
+          </p>
+        </div>
+
+        <p class="about-credit">Made by <strong>Alen Alex</strong></p>
+
+        <div class="modal-actions">
+          <button id="about-close" class="primary-btn">Done</button>
+        </div>
+      </div>
+    </div>
 
     <script type="module" src="sidepanel.js"></script>
   </body>

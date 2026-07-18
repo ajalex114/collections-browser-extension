@@ -8,6 +8,7 @@ import {
   CollectionRepository,
   STORE_COLLECTIONS,
   STORE_META,
+  STORE_SUMMARIES,
   INDEX_UPDATED_AT,
 } from "../../src/repository.js";
 
@@ -36,13 +37,16 @@ export function makeClock(deviceId = "devTest", startAt = 1000) {
 // Fresh adapter over a unique db name, mirroring storage.js's schema.
 export function makeAdapter() {
   const name = `test_db_${process.pid}_${dbSeq++}_${Date.now()}`;
-  return new IndexedDbAdapter(name, 1, (database) => {
+  return new IndexedDbAdapter(name, 2, (database) => {
     if (!database.objectStoreNames.contains(STORE_COLLECTIONS)) {
       const store = database.createObjectStore(STORE_COLLECTIONS, { keyPath: "id" });
       store.createIndex(INDEX_UPDATED_AT, "updatedAt");
     }
     if (!database.objectStoreNames.contains(STORE_META)) {
       database.createObjectStore(STORE_META, { keyPath: "key" });
+    }
+    if (!database.objectStoreNames.contains(STORE_SUMMARIES)) {
+      database.createObjectStore(STORE_SUMMARIES, { keyPath: "id" });
     }
   });
 }

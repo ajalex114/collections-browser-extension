@@ -11,7 +11,15 @@
 
 export const STORE_COLLECTIONS = "collections";
 export const STORE_META = "meta";
+export const STORE_SUMMARIES = "summaries";
 export const INDEX_UPDATED_AT = "updatedAt";
+
+import {
+  ITEM_BUDGET_BYTES,
+  TOTAL_BUDGET_BYTES,
+  collectionSyncBytes,
+  withinItemBudget,
+} from "./limits.js";
 
 export class CollectionRepository {
   /**
@@ -48,6 +56,83 @@ export class CollectionRepository {
     return this._db.getAll(STORE_COLLECTIONS);
   }
 
+  // Lightweight per-collection summaries (id/name/order/counts/preview) — no
+  // item payloads. Reads the `summaries` store so list/menu views scale
+  // independently of how many items each collection holds. Falls back to
+  // deriving from full records until the summaries store is backfilled (first
+  // run after the schema upgrade); the store is always all-or-nothing, so a
+  // non-empty result is complete.
+  async listSummaries() {
+    const sums = await this._db.getAll(STORE_SUMMARIES);
+    if (sums.length) {
+      return sums.filter((s) => s && !s.deletedAt).sort((a, b) => a.order - b.order);
+    }
+    const all = await this._db.getAll(STORE_COLLECTIONS);
+    return all
+      .filter((c) => c && !c.deletedAt)
+      .map(summarize)
+      .sort((a, b) => a.order - b.order);
+  }
+
+  // Backfill the summaries store from existing collections when it is empty
+  // (post-upgrade / post-migration). Single-writer (service worker) only.
+  async ensureSummaries() {
+    const sums = await this._db.getAll(STORE_SUMMARIES);
+    if (sums.length) return;
+    const cols = await this._db.getAll(STORE_COLLECTIONS);
+    if (!cols.length) return;
+    await this._db.putMany(cols.map((c) => ({ store: STORE_SUMMARIES, value: summarize(c) })));
+  }
+
+  // Sum of the synced footprint of every live, syncable collection. Reads only
+  // summaries (no item payloads), so it stays cheap even with large local-only
+  // collections. `excludeId` omits one collection so callers can substitute a
+  // freshly-computed size for it. Falls back to deriving from full records only
+  // while the summaries store is still empty (first run after the upgrade).
+  async _syncedTotalBytes(excludeId = null) {
+    let sums = await this._db.getAll(STORE_SUMMARIES);
+    if (!sums.length) {
+      const cols = await this._db.getAll(STORE_COLLECTIONS);
+      sums = cols.map(summarize);
+    }
+    let total = 0;
+    for (const s of sums) {
+      if (!s || s.deletedAt || s.oversized) continue;
+      if (excludeId && s.id === excludeId) continue;
+      total += typeof s.syncBytes === "number" ? s.syncBytes : 0;
+    }
+    return total;
+  }
+
+  // Current synced-storage usage, for the About panel. Byte totals reflect the
+  // same text-only projection the sync layer pushes.
+  async syncUsage() {
+    let sums = await this._db.getAll(STORE_SUMMARIES);
+    if (!sums.length) {
+      const cols = await this._db.getAll(STORE_COLLECTIONS);
+      sums = cols.map(summarize);
+    }
+    let usedBytes = 0;
+    let syncedCollections = 0;
+    let oversizedCollections = 0;
+    for (const s of sums) {
+      if (!s || s.deletedAt) continue;
+      if (s.oversized) {
+        oversizedCollections++;
+        continue;
+      }
+      usedBytes += typeof s.syncBytes === "number" ? s.syncBytes : 0;
+      syncedCollections++;
+    }
+    return {
+      usedBytes,
+      totalBytes: TOTAL_BUDGET_BYTES,
+      itemBudgetBytes: ITEM_BUDGET_BYTES,
+      syncedCollections,
+      oversizedCollections,
+    };
+  }
+
   // --- Write helpers -------------------------------------------------------
 
   _stamp(record) {
@@ -59,7 +144,10 @@ export class CollectionRepository {
   }
 
   async _save(record) {
-    await this._db.put(STORE_COLLECTIONS, record);
+    await this._db.putMany([
+      { store: STORE_COLLECTIONS, value: record },
+      { store: STORE_SUMMARIES, value: summarize(record) },
+    ]);
     return record;
   }
 
@@ -74,16 +162,29 @@ export class CollectionRepository {
 
   async createCollection(name) {
     const now = this._clock.now();
-    const count = (await this._db.getAll(STORE_COLLECTIONS)).filter((c) => !c.deletedAt).length;
+    const all = await this._db.getAll(STORE_COLLECTIONS);
+    let count = 0;
+    let maxOrder = -1;
+    for (const c of all) {
+      if (!c.deletedAt) count++;
+      if (typeof c.order === "number" && c.order > maxOrder) maxOrder = c.order;
+    }
     const record = this._stamp({
       id: this._clock.uid(),
       name: (name && name.trim()) || `Collection ${count + 1}`,
       createdAt: now,
-      order: await this._nextOrder(),
+      order: maxOrder + 1,
       sections: [],
       items: [],
       deletedAt: null,
     });
+    // Hard-stop: refuse to create a collection that would push synced storage
+    // over its total budget. An empty collection is tiny, so this only trips at
+    // the genuine ceiling.
+    const projected = (await this._syncedTotalBytes()) + collectionSyncBytes(record);
+    if (projected > TOTAL_BUDGET_BYTES) {
+      return { limit: "total" };
+    }
     await this._save(record);
     return normalize(record);
   }
@@ -126,7 +227,14 @@ export class CollectionRepository {
         touched.push(this._stamp(col));
       }
     }
-    if (touched.length) await this._db.bulkPut(STORE_COLLECTIONS, touched);
+    if (touched.length) {
+      const writes = [];
+      for (const col of touched) {
+        writes.push({ store: STORE_COLLECTIONS, value: col });
+        writes.push({ store: STORE_SUMMARIES, value: summarize(col) });
+      }
+      await this._db.putMany(writes);
+    }
   }
 
   // --- Item mutations ------------------------------------------------------
@@ -154,6 +262,16 @@ export class CollectionRepository {
     };
     if (atTop) col.items.unshift(newItem);
     else col.items.push(newItem);
+    // Hard-stop: refuse writes that would make this collection too big to sync,
+    // or push total synced storage over budget. Checked on the candidate record
+    // (with the new item) before persisting, so a blocked add leaves no trace.
+    if (!withinItemBudget(col)) {
+      return { limit: "collection" };
+    }
+    const projectedTotal = (await this._syncedTotalBytes(col.id)) + collectionSyncBytes(col);
+    if (projectedTotal > TOTAL_BUDGET_BYTES) {
+      return { limit: "total" };
+    }
     await this._save(this._stamp(col));
     return newItem;
   }
@@ -276,7 +394,12 @@ export class CollectionRepository {
     const records = collections.map((c) =>
       this._stamp({ ...c, order: order++, deletedAt: null })
     );
-    await this._db.bulkPut(STORE_COLLECTIONS, records);
+    const writes = [];
+    for (const rec of records) {
+      writes.push({ store: STORE_COLLECTIONS, value: rec });
+      writes.push({ store: STORE_SUMMARIES, value: summarize(rec) });
+    }
+    await this._db.putMany(writes);
     return records.length;
   }
 
@@ -303,8 +426,36 @@ export class CollectionRepository {
   // is not immediately pushed back out. LWW arbitration happens in the caller.
   async putRemote(record) {
     record.dirty = false;
-    await this._db.put(STORE_COLLECTIONS, record);
+    await this._db.putMany([
+      { store: STORE_COLLECTIONS, value: record },
+      { store: STORE_SUMMARIES, value: summarize(record) },
+    ]);
   }
+}
+
+// Derive a lightweight summary record from a full collection. Stored in the
+// `summaries` store so list/menu views never load item payloads. `preview` is
+// up to four thumbnail sources (image or favicon) for the card mosaic; empty
+// strings render as fallback tiles. Tombstones carry `deletedAt` so readers can
+// filter them out without loading the full record.
+export function summarize(col) {
+  const items = Array.isArray(col.items) ? col.items : [];
+  const sections = Array.isArray(col.sections) ? col.sections : [];
+  return {
+    id: col.id,
+    name: col.name,
+    order: typeof col.order === "number" ? col.order : 0,
+    createdAt: col.createdAt,
+    sectionCount: sections.length,
+    itemCount: items.length,
+    preview: items.slice(0, 4).map((it) => it.imageUrl || it.favIconUrl || ""),
+    // Precomputed sync footprint so the list view and the hard-stop can measure
+    // total synced usage without ever loading item payloads. `oversized` marks a
+    // collection that cannot sync (kept local-only) and so does not count.
+    syncBytes: collectionSyncBytes(col),
+    oversized: !withinItemBudget(col),
+    deletedAt: col.deletedAt || null,
+  };
 }
 
 // Ensure a record has the arrays/fields the UI expects. Mutates in place and
@@ -322,7 +473,8 @@ export function normalize(col) {
 // Reorder `list` to match `orderedIds`, appending any entries not listed.
 function reorderBy(list, orderedIds) {
   const map = new Map(list.map((x) => [x.id, x]));
+  const listed = new Set(orderedIds);
   const out = orderedIds.map((id) => map.get(id)).filter(Boolean);
-  for (const x of list) if (!orderedIds.includes(x.id)) out.push(x);
+  for (const x of list) if (!listed.has(x.id)) out.push(x);
   return out;
 }
