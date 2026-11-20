@@ -79,7 +79,8 @@ function renderSpotlight() {
       empty.style.display = "none";
       return;
     }
-    matches = entries.filter((e) => e.hay.includes(query));
+    const terms = query.split(/\s+/);
+    matches = entries.filter((e) => terms.every((term) => e.hay.includes(term)));
     selected = 0;
     empty.style.display = matches.length ? "none" : "block";
     matches.forEach((m, idx) => {

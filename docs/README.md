@@ -1,14 +1,15 @@
 # Collection
 
 A Chrome/Edge (Manifest V3) browser extension that reimplements the deprecated
-**Edge Collections** feature. Everything is stored locally in the browser, with
-JSON download/upload for portability.
+**Edge Collections** feature. Full collections are stored locally in the browser, with text-only browser-account
+sync and JSON download/upload for portability. Saved remote images and favicons
+can contact their original hosts; see [Privacy](PRIVACY.md).
 
 ## Features
 
 - **Collections**: create, rename, delete, and drag-to-reorder collections.
 - **Items**: web page cards, free-text note cards, and image cards.
-- **Add pages**: "Add current page" (captures title, favicon, and a thumbnail),
+- **Add pages**: "Add current page" (captures title, URL, and favicon),
   "Add open tabs…" (multi-select picker), or right-click → **Add to Collection**
   for any page, link, image, or selected text.
 - **Edit / delete / reorder** items within a collection (drag-and-drop).
@@ -59,7 +60,8 @@ collection/
 1. Open `edge://extensions` (or `chrome://extensions`).
 2. Enable **Developer mode**.
 3. Click **Load unpacked** and select the **`src/`** folder.
-4. Click the extension's toolbar icon to open the **Collections** side panel.
+4. Click the extension's toolbar icon to open **Collections**. Use **Pin** to
+   switch from its default toolbar popup to the docked side panel.
 
 Requires Chromium/Edge 114+ (for the Side Panel API).
 
@@ -70,7 +72,7 @@ No build step — `src/` loads as-is. Automated tests cover the storage layer
 Node's built-in test runner and `fake-indexeddb`:
 
 ```
-npm install   # once, installs the fake-indexeddb dev dependency
+npm ci --registry=https://registry.npmjs.org
 npm test      # runs node --test on tests/
 ```
 
@@ -81,6 +83,10 @@ To ship to the Chrome Web Store and Edge Add-ons, see **`docs/PUBLISHING.md`**
 **`docs/PRIVACY.md`** (the privacy policy to host and link). Build the upload
 ZIP from the repo root with:
 
-```powershell
-Compress-Archive -Path src\* -DestinationPath collection.zip -Force
+```bash
+npm run package
 ```
+
+Upload `release/collection-extension-1.0.0.zip`. Store artwork is under
+`store/assets/`; screenshots use only fictional content in an isolated browser.
+CI runs the test suite and produces a validated runtime-only ZIP artifact.

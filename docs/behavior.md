@@ -99,12 +99,19 @@ or its behavior changes.
    `view-source:`, IE-mode tabs) it falls back to a small **extension window**. It
    follows the extension's **theme** setting (System/Light/Dark) so it matches the
    collections UI.
+   If focus is in the address bar (or the in-page search cannot take focus), the
+   in-page overlay is removed and a focused extension window opens instead.
+   Clicking the search box keeps the in-page overlay open; clicking the backdrop
+   dismisses it.
 3. Type to search across all collections. In the in-page overlay, keystrokes are
    isolated from the page so typing is never intercepted by page shortcuts. Each
    result shows the
    item title and, below it, its **collection - section** (the `- section` is
    omitted when the item isn't in a section). Searching a **collection name** or
    **section name** lists every item within it.
+   Search words match independently, in any order, including partial words:
+   `learning pipeline` also finds `Learning Platform Pipelines Folder`. All words
+   must occur across the item's title, URL, note, collection, or section.
 4. Use **↑/↓** to move the selection. **Enter** opens the highlighted result in
    the **original tab**; **Ctrl/Cmd+Enter** opens it in a **new tab**. Clicking a
    result opens it (Ctrl/Cmd-click for a new tab). A note or whole-collection
@@ -117,6 +124,8 @@ or its behavior changes.
   lists all items within it. Each result shows `in collection - section`.
   Typing is debounced (~75 ms) so results refresh once you pause, not on every
   keystroke.
+  Like Spotlight, it matches all search words independently rather than
+  requiring an exact phrase.
 
 ### Duplicate links
 - Adding a page/link whose URL already exists in the target collection is
@@ -128,7 +137,12 @@ or its behavior changes.
 
 ### Edit item
 1. Click the ✎ on a card.
-2. Page/image: edit title. Note: edit text. Saved on blur (Enter for titles).
+2. Page/image: edit the **Name** and **URL** fields. Moving between the fields
+   keeps the editor open; press **Enter** or leave the editor to save both.
+   **Esc** cancels unsaved edits. Page URLs must be valid, non-empty URLs;
+   changing a URL to one already saved in the collection is blocked with an
+   "Already in this collection" message. Failed edits keep the editor open.
+   Note: edit text; saved on blur.
 3. Note: while editing, pick a swatch in the color palette to recolor the note
    card. The color is saved immediately and persists.
 
@@ -210,6 +224,27 @@ count badge, followed by the items beneath it — matching a clean, grouped list
   the overlay window itself (spotlight / quick-save).
   within the collection; the new order is saved on drop.
 
+### Dev-only persistent logging
+- When the extension is loaded as an **unpacked (developer) extension**, a
+  secondary `flog()` path is active in the service worker. It posts structured
+  JSON entries to a local log server (`log-server.js`) running on
+  `http://127.0.0.1:7700`, allowing all Ctrl+Space / overlay events to be
+  captured to a file (`collection-debug.ndjson`) across many invocations —
+  useful for diagnosing intermittent issues that don't reproduce on demand.
+- Logged events include: `command` (shortcut fired), `openOverlay.start` (tab
+  URL, injectable flag), `openOverlay.shell_injected` (ms to first paint),
+  `openOverlay.hydrated` (ms to data, collection count),
+  `openOverlay.injection_failed` (error), `openOverlayWindow.created` (popup
+  position, focused-window bounds), `openOverlayWindow.failed` (error).
+- **Automatically disabled in production.** The flag is resolved via
+  `chrome.management.getSelf()` — no manifest changes or build flags needed.
+  If the log server is not running, `flog()` silently no-ops.
+- Start the server: `node log-server.js` (from the repo root).
+- Read logs: `Get-Content collection-debug.ndjson | Select-Object -Last 50`
+- Store packaging replaces the dev logger with an inert module and excludes the
+  local server and captures. The upload ZIP cannot send development network logs,
+  even when loaded unpacked; developer source logging behavior is unchanged.
+
 ## Performance
 - **Overlays paint before data.** The spotlight and quick-save overlays inject
   their shell (search box / panes) immediately using only the theme, then
@@ -221,9 +256,9 @@ count badge, followed by the items beneath it — matching a clean, grouped list
   listener.
 - **The side panel paints its list and settings in parallel.** On open, the
   panel reads collections and settings concurrently instead of waiting for the
-  settings round-trip before rendering the list. The `sync` engine is not part
-  of the panel's boot bundle — it loads lazily (only the service worker needs it
-  eagerly; the panel touches it only when you change a setting).
+  settings round-trip before rendering the list. The sync module is imported
+  statically for compatibility with module service workers; its instance is
+  constructed only when needed. The worker remains the collection sync writer.
 - **List and menus read a summary index, not full collections.** Every write
   maintains a lightweight per-collection summary (name, order, item/section
   counts, and up to four preview thumbnails) in a separate store. The collection
@@ -288,8 +323,13 @@ count badge, followed by the items beneath it — matching a clean, grouped list
   uses its own account); it does not bridge Edge↔Chrome. Images/thumbnails stay
   local. Collections too large for the sync quota remain local-only.
 - Conflicts resolve last-write-wins; deletes propagate via tombstones.
-- No network requests, telemetry, or third-party code — the browser performs all
-  syncing; the extension only reads/writes storage APIs.
+- Sync initializes through static module imports, avoiding the browser's
+  service-worker restriction on dynamic `import()`. Existing local data and
+  browser-account sync settings are preserved.
+- No developer analytics or remotely loaded executable code. Browser-account
+  sync can transmit the text-only projection; displaying saved images, previews,
+  or favicons can request resources from their original hosts. See `PRIVACY.md`
+  for data handling, diagnostics, exports, and deletion details.
 
 ## Sync limits & About
 

@@ -467,25 +467,66 @@ function startEdit(li, item) {
     return;
   }
 
-  const titleInput = document.createElement("input");
-  titleInput.type = "text";
-  titleInput.className = "name-input";
-  titleInput.value = item.title;
-  titleInput.style.width = "100%";
-  body.appendChild(titleInput);
+  li.draggable = false;
+  const collectionId = state.currentCollectionId;
+  const editor = document.createElement("div");
+  editor.className = "item-editor";
+  function field(label, type, value) {
+    const wrapper = document.createElement("label");
+    wrapper.textContent = label;
+    const input = document.createElement("input");
+    input.type = type;
+    input.value = value || "";
+    wrapper.appendChild(input);
+    editor.appendChild(wrapper);
+    return input;
+  }
+  const titleInput = field("Name", "text", item.title);
+  const urlInput = field("URL", "url", item.url);
+  urlInput.required = item.type === "page";
+  body.appendChild(editor);
   titleInput.focus();
   titleInput.select();
 
+  let saving = false;
+  let finished = false;
   const commit = async () => {
-    await Store.updateItem(state.currentCollectionId, item.id, {
-      title: titleInput.value,
-    });
-    renderDetail();
+    if (saving || finished || !urlInput.reportValidity()) return;
+    saving = true;
+    try {
+      const url = urlInput.value.trim();
+      const patch = { title: titleInput.value, url };
+      if (url !== item.url) patch.favIconUrl = faviconFor(url);
+      const result = await Store.updateItem(collectionId, item.id, patch);
+      if (!result) throw new Error("Item no longer exists");
+      if (result.duplicate) {
+        toast("Already in this collection");
+        urlInput.setCustomValidity("Already in this collection");
+        urlInput.reportValidity();
+        return;
+      }
+      finished = true;
+      if (state.currentCollectionId === collectionId) renderDetail();
+    } catch (err) {
+      warn("edit item failed:", err.message);
+      toast(`Could not save item: ${err.message}`);
+    } finally {
+      saving = false;
+    }
   };
-  titleInput.addEventListener("blur", commit);
-  titleInput.addEventListener("keydown", (e) => {
-    if (e.key === "Enter") titleInput.blur();
-    if (e.key === "Escape") renderDetail();
+  urlInput.addEventListener("input", () => urlInput.setCustomValidity(""));
+  editor.addEventListener("focusout", (e) => {
+    if (!editor.contains(e.relatedTarget)) commit();
+  });
+  editor.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      commit();
+    } else if (e.key === "Escape" && !saving) {
+      e.preventDefault();
+      finished = true;
+      renderDetail();
+    }
   });
 }
 
@@ -755,15 +796,13 @@ async function findMatches(query) {
   const q = (query || "").trim().toLowerCase();
   const matches = [];
   if (!q) return matches;
+  const terms = q.split(/\s+/);
   const collections = await Store.getCollections();
   for (const col of collections) {
-    const nameMatch = col.name.toLowerCase().includes(q);
-    // Which sections match by title — every item inside them should be listed.
+    const nameMatch = terms.every((term) => col.name.toLowerCase().includes(term));
     const sectionTitle = {};
-    const sectionMatch = {};
     for (const s of col.sections || []) {
       sectionTitle[s.id] = s.title;
-      sectionMatch[s.id] = s.title.toLowerCase().includes(q);
     }
     let itemMatched = false;
     for (const item of col.items) {
@@ -772,8 +811,7 @@ async function findMatches(query) {
         .filter(Boolean)
         .join(" ")
         .toLowerCase();
-      const inMatchedSection = item.sectionId && sectionMatch[item.sectionId];
-      if (nameMatch || inMatchedSection || hay.includes(q)) {
+      if (terms.every((term) => hay.includes(term))) {
         matches.push({ col, item });
         itemMatched = true;
       }

@@ -1,5 +1,11 @@
 # Packaged builds (generated separately)
 *.zip
+release/
+.playwright-mcp/
+*.log
+*.ndjson
+.env
+.env.*
 
 # Dependencies (dev-only, for the test suite)
 node_modules/

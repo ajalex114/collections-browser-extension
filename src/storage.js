@@ -16,6 +16,7 @@
 // lightweight change beacon. Views observe it exactly as before.
 
 import { IndexedDbAdapter } from "./db.js";
+import { SyncMirror } from "./sync.js";
 import {
   CollectionRepository,
   STORE_COLLECTIONS,
@@ -89,30 +90,20 @@ const settingsBridge = {
   applyRemote: (remote) => writeSettingsLocal(remote),
 };
 
-// SyncMirror is loaded lazily via dynamic import so it stays out of the side
-// panel / popup boot bundle — those surfaces only touch sync when the user
-// saves settings, which is rare and off the hot path. The service worker loads
-// it during init() (it is the single writer and drives cross-device sync).
-// Dynamic import in a module service worker is supported from Chrome 91+; the
-// manifest requires 114.
+// Module service workers require static imports. Construct the mirror only
+// when needed; pages still leave collection synchronization to the worker.
 let syncInstance = null;
-let syncPromise = null;
 function getSync() {
-  if (syncInstance) return Promise.resolve(syncInstance);
-  if (!syncPromise) {
-    syncPromise = import("./sync.js").then(({ SyncMirror }) => {
-      syncInstance = new SyncMirror({
-        repository,
-        deviceId: clock.deviceId,
-        notifier,
-        settingsBridge,
-        log,
-      });
-      syncInstance._deviceId = clock.deviceId;
-      return syncInstance;
+  if (!syncInstance) {
+    syncInstance = new SyncMirror({
+      repository,
+      deviceId: clock.deviceId,
+      notifier,
+      settingsBridge,
+      log,
     });
   }
-  return syncPromise;
+  return Promise.resolve(syncInstance);
 }
 
 // --- Init: device id, migration, sync start --------------------------------

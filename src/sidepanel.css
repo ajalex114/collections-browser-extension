@@ -347,6 +347,29 @@ button {
   word-break: break-word;
 }
 
+.item-editor {
+  display: grid;
+  gap: 8px;
+}
+
+.item-editor label {
+  display: grid;
+  gap: 4px;
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+.item-editor input {
+  width: 100%;
+  min-width: 0;
+  padding: 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+}
+
 .item-card textarea.note-edit {
   width: 100%;
   min-height: 60px;
@@ -967,4 +990,3 @@ button.danger {
   font-size: 12px;
   color: var(--text-dim);
 }
-

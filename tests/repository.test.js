@@ -98,6 +98,37 @@ test("updateItem patches fields; deleteItem removes", async () => {
   assert.equal(col.items.length, 0);
 });
 
+test("editing a link persists its title and URL without changing identity or section", async () => {
+  const { repo } = makeRepo();
+  const col = await repo.createCollection("Links");
+  const section = await repo.addSection(col.id, "Docs");
+  const item = await repo.addItem(col.id, {
+    title: "Old", url: "https://old.test", sectionId: section.id,
+  });
+  await repo.updateItem(col.id, item.id, { title: "New", url: "https://new.test" });
+  const saved = (await repo.getCollection(col.id)).items[0];
+  assert.equal(saved.id, item.id);
+  assert.equal(saved.sectionId, section.id);
+  assert.equal(saved.title, "New");
+  assert.equal(saved.url, "https://new.test");
+});
+
+test("editing a link cannot duplicate another item's URL or partially save its title", async () => {
+  const { repo } = makeRepo();
+  const col = await repo.createCollection("Links");
+  const first = await repo.addItem(col.id, { title: "First", url: "https://first.test" });
+  const second = await repo.addItem(col.id, { title: "Second", url: "https://second.test" });
+  const result = await repo.updateItem(col.id, second.id, {
+    title: "Changed", url: first.url,
+  });
+  assert.equal(result.duplicate, true);
+  const saved = (await repo.getCollection(col.id)).items.find((i) => i.id === second.id);
+  assert.equal(saved.title, second.title);
+  assert.equal(saved.url, second.url);
+  const unchanged = await repo.updateItem(col.id, first.id, { title: "Renamed", url: first.url });
+  assert.equal(unchanged.title, "Renamed");
+});
+
 test("sections: add, rename, and delete unassigns member items", async () => {
   const { repo } = makeRepo();
   const c = await repo.createCollection("C");

@@ -282,6 +282,10 @@ export class CollectionRepository {
     normalize(col);
     const item = col.items.find((i) => i.id === itemId);
     if (!item) return null;
+    if (patch.url && patch.url !== item.url) {
+      const existing = col.items.find((i) => i.id !== itemId && i.url === patch.url);
+      if (existing) return { duplicate: true, item: existing };
+    }
     Object.assign(item, patch);
     await this._save(this._stamp(col));
     return item;

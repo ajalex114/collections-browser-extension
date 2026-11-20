@@ -1,4 +1,5 @@
 import { CollectionStore } from "./storage.js";
+import { flog } from "./dev-logger.js";
 
 const PARENT_ID = "collection-add-parent";
 const NEW_COLLECTION_ID = "collection-add-new";
@@ -10,6 +11,11 @@ let menuChain = Promise.resolve();
 // (edge://extensions → Collection → "service worker" / "Inspect views").
 const log = (...args) => console.log("[Collection][bg]", ...args);
 const warn = (...args) => console.warn("[Collection][bg]", ...args);
+
+// ---------------------------------------------------------------------------
+// Dev-only persistent logging — see src/dev-logger.js and log-server.js.
+// flog() is imported above; it is a no-op in production builds.
+// ---------------------------------------------------------------------------
 
 // Service-worker boot timing. Each cold start logs when the SW script finished
 // evaluating; compare against onStartup/onInstalled/rebuildMenus timings below.
@@ -295,10 +301,7 @@ function flashLimit(scope, tab) {
   }
 }
 
-// Keyboard shortcuts open a centered overlay WINDOW (an extension page) rather
-// than injecting an overlay into the current page. This works everywhere —
-// including edge://, the Web Store, and IE-mode tabs — renders instantly (no
-// injection, no serialized args), and is immune to page-level keyboard handlers.
+// Restricted pages and browser-chrome focus use a centered extension window.
 const PENDING_KEY = "pending_add";
 const OVERLAY_CTX_KEY = "overlay_ctx";
 const OVERLAY_W = 640;
@@ -346,8 +349,16 @@ async function openOverlayWindow(mode) {
   try {
     await chrome.windows.create(opts);
     log(mode, "overlay window opened in", Date.now() - t0, "ms");
+    flog("openOverlayWindow.created", {
+      mode, ms: Date.now() - t0,
+      left: opts.left, top: opts.top,
+      focusedWindowBounds: focused
+        ? { left: focused.left, top: focused.top, width: focused.width, height: focused.height }
+        : null,
+    });
   } catch (err) {
     warn(mode, "overlay window failed:", err?.message);
+    flog("openOverlayWindow.failed", { mode, error: err?.message, ms: Date.now() - t0 });
   }
 }
 
@@ -371,18 +382,31 @@ async function openOverlay(mode) {
     [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
   } catch (_) {}
 
+  flog("openOverlay.start", {
+    mode,
+    tabUrl: tab?.url ?? null,
+    tabId: tab?.id ?? null,
+    injectable: isInjectablePage(tab?.url),
+  });
+
   if (tab && tab.id != null && isInjectablePage(tab.url)) {
     try {
       // Paint the overlay shell immediately using only the theme (a cheap
       // storage.local read) — do NOT wait on the collections snapshot, which on
       // a cold-booted worker also pays IndexedDB open + getAll.
       const { theme } = await CollectionStore.getSettings();
-      await chrome.scripting.executeScript({
+      flog("openOverlay.got_theme", { mode, ms: Date.now() - t0, theme });
+      const results = await chrome.scripting.executeScript({
         target: { tabId: tab.id },
         func,
         args: [null, theme || "system"],
       });
+      if (mode === "spotlight" && results[0]?.result === false) {
+        await openOverlayWindow(mode);
+        return;
+      }
       log(mode, "overlay shell injected in", Date.now() - t0, "ms");
+      flog("openOverlay.shell_injected", { mode, ms: Date.now() - t0 });
 
       // Hydrate with data as soon as it's ready; this never blocks the paint.
       const { collections } = await CollectionStore.getSnapshot();
@@ -392,9 +416,11 @@ async function openOverlay(mode) {
         args: [mode, collections],
       });
       log(mode, "overlay hydrated in", Date.now() - t0, "ms");
+      flog("openOverlay.hydrated", { mode, ms: Date.now() - t0, collectionCount: collections?.length ?? 0 });
       return;
     } catch (err) {
       warn(mode, "injection failed, falling back to window:", err?.message);
+      flog("openOverlay.injection_failed", { mode, error: err?.message, ms: Date.now() - t0 });
     }
   }
   await openOverlayWindow(mode);
@@ -411,6 +437,7 @@ function hydrateOverlay(mode, collections) {
 
 chrome.commands.onCommand.addListener((command) => {
   log("command:", command);
+  flog("command", { command, swAgeMs: Date.now() - SW_T0 });
   if (command === "add-current-tab") openOverlay("quicksave");
   else if (command === "spotlight-search") openOverlay("spotlight");
 });
@@ -424,8 +451,9 @@ function spotlightOverlay(collections, theme) {
   if (existing) {
     const inp = existing.shadowRoot && existing.shadowRoot.querySelector("input");
     if (inp) inp.focus();
-    log("overlay already open, refocused input");
-    return;
+    const focused = document.hasFocus() && existing.shadowRoot?.activeElement === inp;
+    if (!focused) existing.__collClose();
+    return focused;
   }
 
   // Resolve theme: follow the page's OS preference when set to "system".
@@ -539,7 +567,8 @@ function spotlightOverlay(collections, theme) {
       empty.style.display = "none";
       return;
     }
-    matches = entries.filter((e) => e.hay.includes(query));
+    const terms = query.split(/\s+/);
+    matches = entries.filter((e) => terms.every((term) => e.hay.includes(term)));
     selected = 0;
     empty.style.display = matches.length ? "none" : "block";
     matches.forEach((m, idx) => {
@@ -631,13 +660,17 @@ function spotlightOverlay(collections, theme) {
   window.addEventListener("keydown", onKeyCapture, true);
 
   host.addEventListener("click", (e) => {
-    if (e.target === host) close();
+    if (e.composedPath()[0] === host) close();
   });
   // Expose the hydrate hook so the deferred second-phase injection can feed in
   // collections; hydrate inline when they were passed directly.
   host.__collHydrate = hydrate;
+  host.__collClose = close;
   if (Array.isArray(collections)) hydrate(collections);
   input.focus();
+  const focused = document.hasFocus() && shadow.activeElement === input;
+  if (!focused) close();
+  return focused;
 }
 
 // Injected on Ctrl+Shift+S: a centered picker to save the current tab. Lists
