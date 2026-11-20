@@ -27,7 +27,7 @@ jobs:
       - name: Build store upload package
         run: npm run package
       - name: Install isolated test browser
-        run: npx playwright install --with-deps chromium
+        run: npx playwright install chromium
       - name: Check packaged extension in Chromium
         run: npm run test:browser
       - name: Upload store package
